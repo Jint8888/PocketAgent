@@ -27,6 +27,7 @@ from nodes import (
     ThinkNode,
     AnswerNode,
     EmbedNode,
+    SupervisorNode,
 )
 
 
@@ -38,18 +39,20 @@ async def main_async():
     """
     异步主函数
 
-    构建多步推理 Agent 流程 (含记忆):
+    构建多步推理 Agent 流程 (含记忆 + Supervisor):
 
     InputNode -> RetrieveNode -> DecideNode --> "tool" --> ToolNode --+
-                                       |                             |
-                                       +--> "think" -> ThinkNode ----+
-                                       |                             |
-                                       +--> "answer" -> AnswerNode   v
-                                       ^________________________________|
-                                       ^
-    EmbedNode --------------------------+ ("input" 返回等待新任务)
-        ^
-    AnswerNode -------------------------+ ("embed" 进入存储节点)
+                                       |                              |
+                                       +--> "think" -> ThinkNode -----+
+                                       |                              |
+                                       +--> "answer" -> AnswerNode    v
+                                       ^                              |
+                                       |                              v
+                                       |                      SupervisorNode
+                                       |                         /                                              +--- "decide" (retry) ---+                                                                            "embed" v
+                                                                      EmbedNode
+                                                                          |
+    InputNode <----------------------- "input" ---------------------------+
     """
     # ========================================
     # 创建节点实例
@@ -60,6 +63,7 @@ async def main_async():
     tool_node = ToolNode()
     think_node = ThinkNode()
     answer_node = AnswerNode()
+    supervisor_node = SupervisorNode()
     embed_node = EmbedNode()
 
     # ========================================
@@ -82,8 +86,14 @@ async def main_async():
     tool_node - "decide" >> decide_node
     think_node - "decide" >> decide_node
 
-    # AnswerNode 完成后进入 EmbedNode 存储记忆
-    answer_node - "embed" >> embed_node
+    # AnswerNode 完成后进入 SupervisorNode 验证
+    answer_node - "supervisor" >> supervisor_node
+
+    # SupervisorNode 验证通过进入 EmbedNode 存储记忆
+    supervisor_node - "embed" >> embed_node
+
+    # SupervisorNode 验证失败返回 DecideNode 重试
+    supervisor_node - "decide" >> decide_node
 
     # EmbedNode 完成后返回 InputNode 等待新任务
     embed_node - "input" >> input_node
