@@ -58,12 +58,44 @@ DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
 }
 ```
 
+## Embedding 模型
+
+向量记忆使用本地 [Sentence Transformers](https://sbert.net/) 模型，无需 API 调用。
+
+**默认模型**: `paraphrase-multilingual-MiniLM-L12-v2`
+- 维度: 384
+- 特点: 多语言支持，中文语义理解优秀
+
+### 替换模型
+
+修改 `memory.py` 中的 `_get_embedding_model()` 函数：
+
+```python
+def _get_embedding_model():
+    global _embedding_model
+    if _embedding_model is None:
+        from sentence_transformers import SentenceTransformer
+        # 替换为你需要的模型
+        _embedding_model = SentenceTransformer('your-model-name')
+    return _embedding_model
+```
+
+**推荐模型**:
+| 模型 | 维度 | 特点 |
+|------|------|------|
+| `paraphrase-multilingual-MiniLM-L12-v2` | 384 | 多语言，中文友好 (默认) |
+| `all-MiniLM-L6-v2` | 384 | 英文，速度快 |
+| `text2vec-base-chinese` | 768 | 纯中文，效果好 |
+| `bge-small-zh-v1.5` | 512 | 中文，SOTA |
+
+> ⚠️ 更换模型后需删除 `memory_index.json`，因为向量维度可能不同。
+
 ## 项目结构
 
 ```
 ├── main.py          # 入口文件，定义工作流
 ├── nodes.py         # 核心节点实现
-├── memory.py        # 向量记忆模块
+├── memory.py        # 向量记忆模块 (Embedding 配置在此)
 ├── utils.py         # LLM 调用工具
 ├── mcp_client/      # MCP 客户端封装
 └── .env.example     # 环境变量示例
@@ -73,6 +105,7 @@ DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
 
 - [PocketFlow](https://github.com/The-Pocket/PocketFlow) - 轻量级 LLM 工作流框架
 - [MCP](https://modelcontextprotocol.io/) - Model Context Protocol
+- [Sentence Transformers](https://sbert.net/) - 文本向量化
 
 ## License
 
