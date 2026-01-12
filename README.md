@@ -21,18 +21,48 @@ InputNode → RetrieveNode → DecideNode ─┬─→ ToolNode  ──┐
 
 ## 快速开始
 
-```bash
-# 1. 安装依赖
-uv sync
+### 1. 安装 uv (如未安装)
 
-# 2. 配置环境变量
+```bash
+# Windows (PowerShell)
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+
+# macOS / Linux
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+### 2. 创建虚拟环境并安装依赖
+
+```bash
+# 创建虚拟环境
+uv venv
+
+# 激活虚拟环境
+# Windows (PowerShell)
+.venv\Scripts\Activate.ps1
+# Windows (CMD)
+.venv\Scripts\activate.bat
+# macOS / Linux
+source .venv/bin/activate
+
+# 安装依赖
+uv sync
+```
+
+### 3. 配置环境变量
+
+```bash
 cp .env.example .env
 # 编辑 .env 填入你的 API Key
+```
 
-# 3. 配置 MCP 工具 (可选)
-# 创建 mcp.json 配置文件
+### 4. 配置 MCP 工具 (可选)
 
-# 4. 运行
+创建 `mcp.json` 配置文件，参考下方配置说明。
+
+### 5. 运行
+
+```bash
 uv run python main.py
 ```
 
@@ -60,11 +90,13 @@ DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
 
 ## Embedding 模型
 
-向量记忆使用本地 [Sentence Transformers](https://sbert.net/) 模型，无需 API 调用。
+向量记忆使用本地 [Sentence Transformers](https://sbert.net/) 模型，**无需 API 调用**。
 
 **默认模型**: `paraphrase-multilingual-MiniLM-L12-v2`
 - 维度: 384
 - 特点: 多语言支持，中文语义理解优秀
+
+> 💡 **自动下载**: 首次运行时，模型会自动从 HuggingFace Hub 下载到本地缓存 (`~/.cache/huggingface/`)，约 500MB，之后离线可用。
 
 ### 替换模型
 
