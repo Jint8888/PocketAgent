@@ -1,5 +1,5 @@
 """
-MCP Agent 聊天机器人 (多步推理版本 + 记忆集成)
+MCP Agent 聊天机器人 (多步推理版本 + Manus-style Planning)
 
 整合了 MCP 工具调用能力的智能聊天机器人。
 - 使用 PocketFlow 的 AsyncNode/AsyncFlow 实现全异步架构
@@ -7,6 +7,14 @@ MCP Agent 聊天机器人 (多步推理版本 + 记忆集成)
 - 自动工具调用与分析
 - 复杂任务分解与执行
 - 向量记忆检索与存储 (滑动窗口 + 长期记忆)
+- Manus-style Planning: 三文件模式 (task_plan.md, findings.md, progress.md)
+
+Manus-style Features:
+- 复杂任务自动创建规划文件
+- 决策前重读计划 (注意力操纵)
+- 2-动作规则：每 2 次工具调用后更新 findings
+- 错误持久化记录 (避免重复失败)
+- 计划完成度验证
 
 运行方式:
     uv run python main.py
@@ -21,6 +29,7 @@ warnings.filterwarnings("ignore", message="Flow ends:.*not found in", module="po
 
 from nodes import (
     InputNode,
+    PlanningNode,
     RetrieveNode,
     DecideNode,
     ToolNode,
@@ -39,25 +48,35 @@ async def main_async():
     """
     异步主函数
 
-    构建多步推理 Agent 流程 (含记忆 + Supervisor):
+    构建多步推理 Agent 流程 (含记忆 + Manus-style Planning + Supervisor):
 
-    InputNode -> RetrieveNode -> DecideNode --> "tool" --> ToolNode --+
-                                       |                              |
-                                       +--> "think" -> ThinkNode -----+
-                                       |                              |
-                                       +--> "answer" -> AnswerNode    v
-                                       ^                              |
-                                       |                              v
-                                       |                      SupervisorNode
-                                       |                         /                                              +--- "decide" (retry) ---+                                                                            "embed" v
-                                                                      EmbedNode
-                                                                          |
-    InputNode <----------------------- "input" ---------------------------+
+    InputNode -> PlanningNode -> RetrieveNode -> DecideNode --> "tool" --> ToolNode --+
+                                                       |                              |
+                                                       +--> "think" -> ThinkNode -----+
+                                                       |                              |
+                                                       +--> "answer" -> AnswerNode    v
+                                                       ^                              |
+                                                       |                              v
+                                                       |                      SupervisorNode
+                                                       |                         /            \
+                                                       +--- "decide" (retry) ---+              |
+                                                                                         "embed" v
+                                                                                          EmbedNode
+                                                                                              |
+    InputNode <----------------------- "input" -----------------------------------------------+
+
+    Manus-style Planning Flow:
+    - PlanningNode: 判断任务复杂度，创建规划文件 (task_plan.md, findings.md, progress.md)
+    - DecideNode: 决策前重读计划 (注意力操纵)
+    - ToolNode: 2-动作规则，记录进度和发现
+    - ThinkNode: 更新分析阶段状态
+    - SupervisorNode: 检查计划完成度，记录错误
     """
     # ========================================
     # 创建节点实例
     # ========================================
     input_node = InputNode()
+    planning_node = PlanningNode()
     retrieve_node = RetrieveNode()
     decide_node = DecideNode()
     tool_node = ToolNode()
@@ -70,9 +89,12 @@ async def main_async():
     # 连接节点
     # ========================================
 
-    # InputNode 处理完用户输入后进入记忆检索
-    input_node - "retrieve" >> retrieve_node
+    # InputNode 处理完用户输入后进入规划节点
+    input_node - "planning" >> planning_node
     input_node - "input" >> input_node  # 空输入时重新获取
+
+    # PlanningNode 创建规划后进入记忆检索
+    planning_node - "retrieve" >> retrieve_node
 
     # RetrieveNode 检索记忆后进入决策
     retrieve_node - "decide" >> decide_node

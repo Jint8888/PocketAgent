@@ -1,0 +1,53 @@
+{
+  "mcpServers": {
+    "filesystem": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "<YOUR_PROJECT_PATH>/sandbox"],
+      "description": "[核心] 本地文件系统 - Manus-style Planning 规划文件存储",
+      "enabled": true,
+      "timeout": 60,
+      "_comment": "必需！请将 <YOUR_PROJECT_PATH> 替换为实际项目路径"
+    },
+    "excel-stdio": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["excel-mcp-server", "stdio"],
+      "description": "Excel MCP Server - Excel 文件处理与分析",
+      "enabled": true,
+      "timeout": 60
+    },
+    "context7": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@upstash/context7-mcp"],
+      "description": "Context7 MCP Server - 实时代码文档查询",
+      "enabled": true,
+      "timeout": 60
+    },
+    "trends-hub": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "mcp-trends-hub@1.6.2"],
+      "description": "热点趋势聚合 MCP 服务器，获取各平台热搜数据",
+      "enabled": true,
+      "timeout": 60
+    },
+    "gaode": {
+      "type": "sse",
+      "url": "https://mcp.amap.com/sse?key=<YOUR_AMAP_KEY>",
+      "description": "高德地图 MCP 服务器，提供地图、导航、POI搜索、天气等服务",
+      "enabled": false,
+      "timeout": 10,
+      "_comment": "请将 <YOUR_AMAP_KEY> 替换为你的高德 API Key"
+    },
+    "example-sse-server": {
+      "type": "sse",
+      "url": "http://localhost:8080/sse",
+      "description": "SSE 类型 MCP 服务器示例",
+      "enabled": false,
+      "timeout": 60,
+      "_comment": "SSE 服务器需要先启动服务"
+    }
+  }
+}

@@ -1,18 +1,28 @@
 """
-多步推理 Agent 节点模块
+多步推理 Agent 节点模块 (Manus-style Planning Enhanced)
 
 包含以下异步节点:
 - InputNode: 获取用户输入
+- PlanningNode: 任务规划节点 (Manus-style)
 - RetrieveNode: 检索相关历史记忆
-- DecideNode: 决策节点 (核心)
+- DecideNode: 决策节点 (核心，含计划重读)
 - ToolNode: 工具执行节点
 - ThinkNode: 思考推理节点
 - AnswerNode: 生成最终回答
-- SupervisorNode: 答案质量监督节点
+- SupervisorNode: 答案质量监督节点 (含计划完成度检查)
 - EmbedNode: 存储对话到向量记忆
+
+Manus-style Planning Features:
+- 三文件模式: task_plan.md, findings.md, progress.md
+- 决策前重读计划 (注意力操纵)
+- 错误持久化记录
+- 计划完成度验证
 """
 
+import os
 import yaml
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from pocketflow import AsyncNode
 
 from utils import call_llm_async, async_input
@@ -30,6 +40,7 @@ class Action:
     THINK = "think"
     ANSWER = "answer"
     INPUT = "input"
+    PLANNING = "planning"  # 任务规划 (Manus-style)
     RETRIEVE = "retrieve"
     DECIDE = "decide"
     EMBED = "embed"
@@ -103,10 +114,263 @@ MEMORY_DEDUP_THRESHOLD = 0.85
 SUPERVISOR_MAX_RETRIES = 2
 
 # ============================================================================
+# Manus-style Planning 配置
+# ============================================================================
+
+# 规划文件存放目录 (相对于项目根目录的 sandbox)
+PLANNING_DIR = "sandbox"
+
+# 规划文件名
+PLAN_FILE = "task_plan.md"
+FINDINGS_FILE = "findings.md"
+PROGRESS_FILE = "progress.md"
+
+# 复杂任务判定阈值（关键词数量或长度）
+COMPLEX_TASK_MIN_LENGTH = 20
+COMPLEX_TASK_KEYWORDS = [
+    "分析", "比较", "研究", "调查", "评估", "总结",
+    "analyze", "compare", "research", "investigate", "evaluate", "summarize",
+    "多个", "几个", "所有", "multiple", "several", "all",
+    "步骤", "流程", "方案", "steps", "process", "plan"
+]
+
+# 2-动作规则：每 N 次工具调用后更新 findings
+FINDINGS_UPDATE_INTERVAL = 2
+
+# ============================================================================
+# 内置时钟工具 - 城市/地区到时区映射
+# ============================================================================
+
+CITY_TIMEZONE_MAP = {
+    # 中国
+    "北京": "Asia/Shanghai", "上海": "Asia/Shanghai", "深圳": "Asia/Shanghai",
+    "广州": "Asia/Shanghai", "成都": "Asia/Shanghai", "重庆": "Asia/Shanghai",
+    "香港": "Asia/Hong_Kong", "澳门": "Asia/Macau", "台北": "Asia/Taipei",
+
+    # 亚洲
+    "东京": "Asia/Tokyo", "大阪": "Asia/Tokyo",
+    "首尔": "Asia/Seoul", "釜山": "Asia/Seoul",
+    "新加坡": "Asia/Singapore",
+    "曼谷": "Asia/Bangkok",
+    "雅加达": "Asia/Jakarta",
+    "马尼拉": "Asia/Manila",
+    "吉隆坡": "Asia/Kuala_Lumpur",
+    "河内": "Asia/Ho_Chi_Minh",
+    "胡志明": "Asia/Ho_Chi_Minh",
+    "新德里": "Asia/Kolkata", "孟买": "Asia/Kolkata",
+    "迪拜": "Asia/Dubai",
+
+    # 欧洲
+    "伦敦": "Europe/London",
+    "巴黎": "Europe/Paris",
+    "柏林": "Europe/Berlin", "法兰克福": "Europe/Berlin",
+    "罗马": "Europe/Rome", "米兰": "Europe/Rome",
+    "马德里": "Europe/Madrid", "巴塞罗那": "Europe/Madrid",
+    "阿姆斯特丹": "Europe/Amsterdam",
+    "布鲁塞尔": "Europe/Brussels",
+    "苏黎世": "Europe/Zurich",
+    "莫斯科": "Europe/Moscow",
+
+    # 美洲
+    "纽约": "America/New_York", "华盛顿": "America/New_York", "波士顿": "America/New_York",
+    "洛杉矶": "America/Los_Angeles", "旧金山": "America/Los_Angeles", "西雅图": "America/Los_Angeles",
+    "芝加哥": "America/Chicago",
+    "多伦多": "America/Toronto",
+    "温哥华": "America/Vancouver",
+    "墨西哥城": "America/Mexico_City",
+    "圣保罗": "America/Sao_Paulo",
+    "布宜诺斯艾利斯": "America/Argentina/Buenos_Aires",
+
+    # 大洋洲
+    "悉尼": "Australia/Sydney", "墨尔本": "Australia/Melbourne",
+    "奥克兰": "Pacific/Auckland",
+
+    # 英文城市名
+    "beijing": "Asia/Shanghai", "shanghai": "Asia/Shanghai",
+    "tokyo": "Asia/Tokyo", "seoul": "Asia/Seoul",
+    "singapore": "Asia/Singapore", "hong kong": "Asia/Hong_Kong",
+    "london": "Europe/London", "paris": "Europe/Paris",
+    "berlin": "Europe/Berlin", "moscow": "Europe/Moscow",
+    "new york": "America/New_York", "los angeles": "America/Los_Angeles",
+    "chicago": "America/Chicago", "toronto": "America/Toronto",
+    "sydney": "Australia/Sydney", "auckland": "Pacific/Auckland",
+}
+
+
+# ============================================================================
+# 规划文件操作辅助函数
+# ============================================================================
+
+def get_planning_file_path(filename: str) -> str:
+    """获取规划文件的完整路径"""
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_dir, PLANNING_DIR, filename)
+
+
+def read_planning_file(filename: str) -> str | None:
+    """读取规划文件内容"""
+    filepath = get_planning_file_path(filename)
+    try:
+        if os.path.exists(filepath):
+            with open(filepath, "r", encoding="utf-8") as f:
+                return f.read()
+    except Exception as e:
+        print(f"   [WARN] Failed to read {filename}: {e}")
+    return None
+
+
+def write_planning_file(filename: str, content: str) -> bool:
+    """写入规划文件"""
+    filepath = get_planning_file_path(filename)
+    try:
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(content)
+        return True
+    except Exception as e:
+        print(f"   [WARN] Failed to write {filename}: {e}")
+        return False
+
+
+def update_plan_phase(phase_num: int, completed: bool = False) -> bool:
+    """更新计划文件中的阶段状态"""
+    content = read_planning_file(PLAN_FILE)
+    if not content:
+        return False
+
+    # 更新复选框状态
+    old_marker = f"- [ ] Phase {phase_num}:"
+    new_marker = f"- [x] Phase {phase_num}:" if completed else f"- [ ] Phase {phase_num}:"
+
+    if old_marker in content or f"- [x] Phase {phase_num}:" in content:
+        content = content.replace(f"- [ ] Phase {phase_num}:", new_marker)
+        content = content.replace(f"- [x] Phase {phase_num}:", new_marker)
+
+        # 更新当前阶段
+        if not completed:
+            import re
+            content = re.sub(r"## Current Phase\n.*", f"## Current Phase\nPhase {phase_num}", content)
+
+        return write_planning_file(PLAN_FILE, content)
+    return False
+
+
+def append_to_findings(title: str, source: str, finding: str, implications: str = "") -> bool:
+    """追加发现到 findings.md"""
+    content = read_planning_file(FINDINGS_FILE)
+    if not content:
+        return False
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    new_entry = f"""
+### [{timestamp}] {title}
+**Source**: {source}
+**Finding**:
+{finding}
+
+**Implications**:
+- {implications if implications else "Pending analysis"}
+
+---
+"""
+    content += new_entry
+    return write_planning_file(FINDINGS_FILE, content)
+
+
+def append_to_progress(action_type: str, description: str, tool_name: str = "", result: str = "") -> bool:
+    """追加进度到 progress.md"""
+    content = read_planning_file(PROGRESS_FILE)
+    if not content:
+        return False
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    tool_line = f"\n- Tool: {tool_name}" if tool_name else ""
+    result_line = f"\n- Result: {result[:100]}..." if result and len(result) > 100 else (f"\n- Result: {result}" if result else "")
+
+    new_entry = f"""
+### [{timestamp}] {action_type}
+- {description}{tool_line}{result_line}
+
+"""
+    content += new_entry
+    return write_planning_file(PROGRESS_FILE, content)
+
+
+def record_error_in_plan(error: str) -> bool:
+    """在计划文件中记录错误（避免重复）"""
+    content = read_planning_file(PLAN_FILE)
+    if not content:
+        return False
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    error_entry = f"\n- [{timestamp}] {error}"
+
+    # 在 Errors Encountered 部分追加
+    if "## Errors Encountered" in content:
+        parts = content.split("## Errors Encountered")
+        if len(parts) == 2:
+            content = parts[0] + "## Errors Encountered" + parts[1].split("\n##")[0] + error_entry
+            if "\n##" in parts[1]:
+                content += "\n##" + "\n##".join(parts[1].split("\n##")[1:])
+            return write_planning_file(PLAN_FILE, content)
+    return False
+
+
+def get_plan_completion_status() -> tuple[int, int, list[str]]:
+    """获取计划完成状态: (已完成数, 总数, 未完成阶段列表)"""
+    content = read_planning_file(PLAN_FILE)
+    if not content:
+        return 0, 0, []
+
+    import re
+    completed = len(re.findall(r"- \[x\] Phase \d+:", content))
+    total = len(re.findall(r"- \[.\] Phase \d+:", content))
+
+    # 获取未完成阶段
+    uncompleted = re.findall(r"- \[ \] (Phase \d+:[^-\n]+)", content)
+
+    return completed, total, uncompleted
+
+
+def is_complex_task(task: str) -> bool:
+    """判断是否为复杂任务，需要创建规划文件"""
+    # 长度检查
+    if len(task) >= COMPLEX_TASK_MIN_LENGTH:
+        return True
+
+    # 关键词检查
+    task_lower = task.lower()
+    for keyword in COMPLEX_TASK_KEYWORDS:
+        if keyword in task_lower:
+            return True
+
+    return False
+
+
+def cleanup_planning_files() -> None:
+    """清理规划文件（任务完成后）"""
+    for filename in [PLAN_FILE, FINDINGS_FILE, PROGRESS_FILE]:
+        filepath = get_planning_file_path(filename)
+        try:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+        except Exception:
+            pass
+
+
+# ============================================================================
 # 系统提示词模板
 # ============================================================================
 
 AGENT_SYSTEM_PROMPT = """你是一个智能助手，可以通过 MCP 协议调用各种工具来帮助用户解决复杂问题。
+
+### 当前时间
+{current_datetime}
+
+### 项目路径
+- 项目根目录: {project_root}
+- sandbox 目录: {sandbox_path}
+- 当用户提到 "sandbox"、"沙盒" 或 "工作目录" 时，使用上述 sandbox 路径
 
 ### 可用工具
 {tool_info}
@@ -155,9 +419,23 @@ answer: |
 4. tool_params 的值如果包含特殊字符需要用引号包裹
 5. 多行文本使用 | 符号
 
+### 内置工具（无需 MCP，随时可用）
+- **get_current_time**: 获取当前准确时间
+  - 无参数: 返回本地时间
+  - 参数 city: 返回指定城市的时间 (如 "北京", "东京", "纽约", "伦敦" 等)
+  - 参数 timezone: 返回指定时区的时间 (如 "Asia/Shanghai", "America/New_York" 等)
+  - 示例: `tool_params: {{city: "东京"}}` 或 `tool_params: {{timezone: "Asia/Tokyo"}}`
+
+- **save_to_memory**: 将重要内容保存到长期记忆
+  - 当用户明确要求保存某些重要信息、结果或结论时使用
+  - 参数 content (必需): 要保存的内容
+  - 参数 tag (可选): 记忆标签，便于后续检索 (如 "股票分析", "会议记录")
+  - 示例: `tool_params: {{content: "茅台股票分析结论...", tag: "股票分析"}}`
+
 ### 注意事项
 - 复杂任务需要多步完成，不要急于回答
 - 先调用工具获取数据，再思考分析
+- 需要知道当前时间时，调用 get_current_time 工具
 - 股票代码格式说明：
   - xueqiu 工具使用前缀格式：SH600016（上海）、SZ000001（深圳）
   - financial-analysis 工具使用后缀格式：600016.SH、000001.SZ
@@ -220,6 +498,21 @@ class InputNode(AsyncNode):
         # ========================================
         if "mcp_manager" not in shared:
             print("\n[INFO] Initializing MCP tool system...")
+
+            # 获取当前时间（用于系统提示词和欢迎消息）
+            # 使用 astimezone() 获取带时区的本地时间
+            current_dt = datetime.now().astimezone()
+            utc_offset = current_dt.strftime("%z")  # 如 +0800
+            utc_offset_formatted = f"UTC{utc_offset[:3]}:{utc_offset[3:]}"  # 格式化为 UTC+08:00
+            current_datetime_str = current_dt.strftime("%Y-%m-%d %H:%M:%S (%A)") + f" [{utc_offset_formatted}]"
+            shared["current_datetime"] = current_datetime_str
+
+            # 获取项目路径（用于系统提示词）
+            project_root = os.path.dirname(os.path.abspath(__file__))
+            sandbox_path = os.path.join(project_root, PLANNING_DIR)
+            shared["project_root"] = project_root
+            shared["sandbox_path"] = sandbox_path
+
             try:
                 manager = MCPManager("mcp.json")
                 await manager.get_all_tools_async()
@@ -227,16 +520,31 @@ class InputNode(AsyncNode):
 
                 if manager.tools:
                     tool_info = manager.format_tools_for_prompt()
-                    shared["system_prompt"] = AGENT_SYSTEM_PROMPT.format(tool_info=tool_info)
+                    shared["system_prompt"] = AGENT_SYSTEM_PROMPT.format(
+                        tool_info=tool_info,
+                        current_datetime=current_datetime_str,
+                        project_root=project_root,
+                        sandbox_path=sandbox_path
+                    )
                     print(f"[OK] Loaded {len(manager.tools)} tools")
                 else:
-                    shared["system_prompt"] = AGENT_SYSTEM_PROMPT.format(tool_info="(no tools)")
+                    shared["system_prompt"] = AGENT_SYSTEM_PROMPT.format(
+                        tool_info="(no tools)",
+                        current_datetime=current_datetime_str,
+                        project_root=project_root,
+                        sandbox_path=sandbox_path
+                    )
                     print("[WARN] No tools available")
 
             except Exception as e:
                 print(f"[WARN] MCP initialization failed: {e}")
                 shared["mcp_manager"] = None
-                shared["system_prompt"] = AGENT_SYSTEM_PROMPT.format(tool_info="(init failed)")
+                shared["system_prompt"] = AGENT_SYSTEM_PROMPT.format(
+                    tool_info="(init failed)",
+                    current_datetime=current_datetime_str,
+                    project_root=project_root,
+                    sandbox_path=sandbox_path
+                )
 
             # 初始化对话历史
             shared["messages"] = []
@@ -247,6 +555,7 @@ class InputNode(AsyncNode):
 
             print("\n" + "=" * 50)
             print("Welcome! Multi-step reasoning assistant ready.")
+            print(f"Current time: {current_datetime_str}")
             print("Type 'exit' to quit.")
             print("=" * 50)
 
@@ -284,7 +593,7 @@ class InputNode(AsyncNode):
         shared["current_task"] = exec_res
         shared["context"] = ""
         shared["step_count"] = 0
-        shared["max_steps"] = 10
+        shared["max_steps"] = 25  # 复杂任务需要更多步骤
 
         # 添加到对话历史
         shared["messages"].append({"role": "user", "content": exec_res})
@@ -292,7 +601,118 @@ class InputNode(AsyncNode):
         print(f"\n[Task]: {exec_res}")
         print("-" * 40)
 
-        return Action.RETRIEVE  # 先检索记忆
+        return Action.PLANNING  # 先进入规划节点
+
+
+class PlanningNode(AsyncNode):
+    """
+    任务规划节点 (Manus-style)
+
+    职责:
+    - 判断任务复杂度
+    - 为复杂任务创建规划文件 (task_plan.md, findings.md, progress.md)
+    - 简单任务直接跳过
+    """
+
+    async def prep_async(self, shared):
+        """准备规划所需信息"""
+        task = shared.get("current_task", "")
+        return {"task": task}
+
+    async def exec_async(self, prep_res):
+        """判断是否需要规划并创建文件"""
+        task = prep_res.get("task", "")
+
+        # 判断任务复杂度
+        needs_planning = is_complex_task(task)
+
+        if not needs_planning:
+            return {"needs_planning": False}
+
+        # 确定任务类型
+        task_lower = task.lower()
+        if any(kw in task_lower for kw in ["分析", "analyze", "研究", "research"]):
+            task_type = "Research & Analysis"
+        elif any(kw in task_lower for kw in ["比较", "compare", "对比"]):
+            task_type = "Comparison"
+        elif any(kw in task_lower for kw in ["总结", "summarize", "汇总"]):
+            task_type = "Summarization"
+        else:
+            task_type = "Multi-step Task"
+
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+        return {
+            "needs_planning": True,
+            "task": task,
+            "task_type": task_type,
+            "timestamp": timestamp
+        }
+
+    async def post_async(self, shared, prep_res, exec_res):
+        """创建规划文件或跳过"""
+        if not exec_res.get("needs_planning"):
+            print("   [Planning] Simple task, skipping planning files")
+            shared["has_plan"] = False
+            return Action.RETRIEVE
+
+        task = exec_res["task"]
+        task_type = exec_res["task_type"]
+        timestamp = exec_res["timestamp"]
+
+        # 读取模板并填充
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        templates_dir = os.path.join(base_dir, "templates")
+
+        # 创建 task_plan.md
+        try:
+            with open(os.path.join(templates_dir, "task_plan.md"), "r", encoding="utf-8") as f:
+                plan_template = f.read()
+            plan_content = plan_template.format(
+                goal=task,
+                task_type=task_type,
+                timestamp=timestamp
+            )
+            write_planning_file(PLAN_FILE, plan_content)
+            print(f"   [Planning] Created {PLAN_FILE}")
+        except Exception as e:
+            print(f"   [WARN] Failed to create {PLAN_FILE}: {e}")
+
+        # 创建 findings.md
+        try:
+            with open(os.path.join(templates_dir, "findings.md"), "r", encoding="utf-8") as f:
+                findings_template = f.read()
+            findings_content = findings_template.format(
+                task=task,
+                timestamp=timestamp,
+                initial_finding="Task analysis initiated"
+            )
+            write_planning_file(FINDINGS_FILE, findings_content)
+            print(f"   [Planning] Created {FINDINGS_FILE}")
+        except Exception as e:
+            print(f"   [WARN] Failed to create {FINDINGS_FILE}: {e}")
+
+        # 创建 progress.md
+        try:
+            with open(os.path.join(templates_dir, "progress.md"), "r", encoding="utf-8") as f:
+                progress_template = f.read()
+            progress_content = progress_template.format(
+                task=task,
+                timestamp=timestamp
+            )
+            write_planning_file(PROGRESS_FILE, progress_content)
+            print(f"   [Planning] Created {PROGRESS_FILE}")
+        except Exception as e:
+            print(f"   [WARN] Failed to create {PROGRESS_FILE}: {e}")
+
+        # 标记已创建规划
+        shared["has_plan"] = True
+        shared["tool_call_count"] = 0  # 用于 2-动作规则
+
+        print(f"   [Planning] Task type: {task_type}")
+        print(f"   [Planning] Planning files created in {PLANNING_DIR}/")
+
+        return Action.RETRIEVE
 
 
 class RetrieveNode(AsyncNode):
@@ -372,27 +792,47 @@ class RetrieveNode(AsyncNode):
 
 class DecideNode(AsyncNode):
     """
-    决策节点 (核心)
+    决策节点 (核心，含计划重读)
 
     职责:
+    - 决策前重读计划文件 (Manus-style 注意力操纵)
     - 分析任务和上下文
     - 决定下一步: tool / think / answer
     """
 
     async def prep_async(self, shared):
-        """准备决策所需的上下文"""
+        """准备决策所需的上下文（含计划重读）"""
         task = shared.get("current_task", "")
         context = shared.get("context", "")
         step_count = shared.get("step_count", 0)
         max_steps = shared.get("max_steps", 10)
         retrieved_memory = shared.get("retrieved_memory", "")
+        has_plan = shared.get("has_plan", False)
 
         # 检查步数限制
         if step_count >= max_steps:
             return {"force_answer": True, "task": task, "context": context}
 
+        # ========================================
+        # Manus-style: 决策前重读计划 (注意力操纵)
+        # ========================================
+        plan_context = ""
+        if has_plan:
+            plan_content = read_planning_file(PLAN_FILE)
+            if plan_content:
+                # 提取关键部分：目标、当前阶段、进度
+                plan_summary = self._extract_plan_summary(plan_content)
+                if plan_summary:
+                    plan_context = f"### Current Plan Status\n{plan_summary}\n\n"
+                    print(f"   [Decide] Re-read plan for attention focus")
+
         # 构建上下文，包含检索到的记忆
         full_context = ""
+
+        # 计划放在最前面（推入近期注意力）
+        if plan_context:
+            full_context += plan_context
+
         if retrieved_memory:
             full_context += f"### Related Past Conversations\n{retrieved_memory}\n\n"
         if context:
@@ -428,6 +868,42 @@ Reply in YAML format."""
         shared["step_count"] = step_count + 1
 
         return {"messages": messages, "force_answer": False, "task": task, "context": context}
+
+    def _extract_plan_summary(self, plan_content: str) -> str:
+        """从计划文件中提取关键摘要"""
+        import re
+
+        summary_parts = []
+
+        # 提取目标
+        goal_match = re.search(r"## Goal\n(.+?)(?=\n##|\Z)", plan_content, re.DOTALL)
+        if goal_match:
+            goal = goal_match.group(1).strip()[:200]
+            summary_parts.append(f"Goal: {goal}")
+
+        # 提取当前阶段
+        phase_match = re.search(r"## Current Phase\n(.+?)(?=\n##|\Z)", plan_content, re.DOTALL)
+        if phase_match:
+            phase = phase_match.group(1).strip()
+            summary_parts.append(f"Current: {phase}")
+
+        # 提取完成状态
+        completed, total, uncompleted = get_plan_completion_status()
+        if total > 0:
+            summary_parts.append(f"Progress: {completed}/{total} phases completed")
+            if uncompleted:
+                next_phase = uncompleted[0] if uncompleted else ""
+                summary_parts.append(f"Next: {next_phase}")
+
+        # 提取最近错误（帮助避免重复）
+        if "## Errors Encountered" in plan_content:
+            errors_section = plan_content.split("## Errors Encountered")[1].split("\n##")[0]
+            error_lines = [l.strip() for l in errors_section.split("\n") if l.strip().startswith("-")]
+            if error_lines:
+                recent_error = error_lines[-1][:100]
+                summary_parts.append(f"Recent Error: {recent_error}")
+
+        return "\n".join(summary_parts) if summary_parts else ""
 
     async def exec_async(self, prep_res):
         """调用 LLM 进行决策（含 YAML 解析重试机制）"""
@@ -515,11 +991,13 @@ Reply in YAML format."""
 
 class ToolNode(AsyncNode):
     """
-    工具执行节点
+    工具执行节点 (含 Manus-style 2-动作规则)
 
     职责:
     - 调用 MCP 工具
     - 将结果添加到上下文
+    - 实现 2-动作规则：每 N 次工具调用后更新 findings
+    - 记录进度到 progress.md
     """
 
     async def prep_async(self, shared):
@@ -546,37 +1024,196 @@ class ToolNode(AsyncNode):
 
     async def post_async(self, shared, prep_res, exec_res):
         """在 post 中执行工具调用（可以访问 shared）"""
+        tool_name = exec_res.get("tool_name", "")
+        tool_params = exec_res.get("tool_params", {})
+        has_plan = shared.get("has_plan", False)
+
+        # ========================================
+        # 内置工具处理（不需要 MCP）
+        # ========================================
+        if tool_name == "get_current_time":
+            # 内置时钟工具：返回当前准确时间（支持多时区）
+            city = tool_params.get("city", "")
+            tz_name = tool_params.get("timezone", "")
+            location_info = ""
+
+            # 确定时区
+            target_tz = None
+            if city:
+                # 从城市映射查找时区
+                city_lower = city.lower()
+                tz_name = CITY_TIMEZONE_MAP.get(city) or CITY_TIMEZONE_MAP.get(city_lower)
+                if tz_name:
+                    try:
+                        target_tz = ZoneInfo(tz_name)
+                        location_info = f" [{city}]"
+                    except Exception:
+                        location_info = f" [Unknown city: {city}, using local time]"
+                else:
+                    location_info = f" [Unknown city: {city}, using local time]"
+            elif tz_name:
+                # 直接使用时区名称
+                try:
+                    target_tz = ZoneInfo(tz_name)
+                    location_info = f" [{tz_name}]"
+                except Exception:
+                    location_info = f" [Invalid timezone: {tz_name}, using local time]"
+
+            # 获取时间
+            if target_tz:
+                current_dt = datetime.now(target_tz)
+                result_str = current_dt.strftime("%Y-%m-%d %H:%M:%S (%A)") + location_info
+            else:
+                # 本地时间：附加系统时区信息，让 Agent 知道基准时区
+                current_dt = datetime.now().astimezone()  # 带时区的本地时间
+                utc_offset = current_dt.strftime("%z")  # 如 +0800
+                utc_offset_formatted = f"UTC{utc_offset[:3]}:{utc_offset[3:]}"  # 格式化为 UTC+08:00
+                result_str = current_dt.strftime("%Y-%m-%d %H:%M:%S (%A)") + f" [Local: {utc_offset_formatted}]"
+            print(f"   [OK] Built-in tool result: {result_str}")
+
+            # 添加到上下文
+            context = shared.get("context", "")
+            shared["context"] = context + f"\n\n### Tool Call: {tool_name} (Built-in)\nResult: {result_str}"
+
+            # Manus-style 进度记录
+            if has_plan:
+                append_to_progress(
+                    action_type="Built-in Tool",
+                    description=f"Called get_current_time{location_info}",
+                    result=result_str
+                )
+
+            return Action.DECIDE
+
+        # ========================================
+        # 内置工具: save_to_memory - 用户主动保存到长期记忆
+        # ========================================
+        if tool_name == "save_to_memory":
+            content = tool_params.get("content", "")
+            tag = tool_params.get("tag", "用户保存")
+
+            if not content:
+                result_str = "Error: content parameter is required"
+                print(f"   [ERROR] {result_str}")
+            else:
+                # 获取记忆索引
+                memory_index = shared.get("memory_index")
+                if not memory_index:
+                    memory_index = get_memory_index()
+                    shared["memory_index"] = memory_index
+
+                # 添加时间戳和标签
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+                memory_content = f"[{tag}] [{timestamp}]\n{content}"
+
+                # 生成嵌入并存储
+                embedding = get_embedding(memory_content)
+                idx, is_new = memory_index.add_or_update(
+                    embedding,
+                    {"content": memory_content, "tag": tag, "timestamp": timestamp},
+                    dedup_threshold=MEMORY_DEDUP_THRESHOLD
+                )
+
+                # 立即保存到文件
+                memory_index.save("memory_index.json")
+
+                if is_new:
+                    result_str = f"Successfully saved to long-term memory (index: {idx}, tag: {tag})"
+                else:
+                    result_str = f"Updated existing similar memory (index: {idx}, tag: {tag})"
+
+                print(f"   [OK] Built-in tool result: {result_str}")
+
+            # 添加到上下文
+            context = shared.get("context", "")
+            shared["context"] = context + f"\n\n### Tool Call: {tool_name} (Built-in)\nResult: {result_str}"
+
+            # Manus-style 进度记录
+            if has_plan:
+                append_to_progress(
+                    action_type="Built-in Tool",
+                    description=f"Saved to memory with tag: {tag}",
+                    result=result_str
+                )
+
+            return Action.DECIDE
+
+        # ========================================
+        # MCP 工具处理
+        # ========================================
         manager = shared.get("mcp_manager")
         if not manager:
             print("   [ERROR] MCP Manager not initialized")
             shared["context"] += "\n\n[Tool call failed: MCP Manager not initialized]"
+            # 记录错误到计划文件
+            if shared.get("has_plan"):
+                record_error_in_plan("MCP Manager not initialized")
             return Action.DECIDE
-
-        tool_name = exec_res.get("tool_name", "")
-        tool_params = exec_res.get("tool_params", {})
 
         try:
             result = await manager.call_tool_async(tool_name, tool_params)
-            print(f"   [OK] Tool result: {result[:200]}..." if len(str(result)) > 200 else f"   [OK] Tool result: {result}")
+            result_str = str(result)
+            print(f"   [OK] Tool result: {result_str[:200]}..." if len(result_str) > 200 else f"   [OK] Tool result: {result_str}")
 
             # 添加到上下文
             context = shared.get("context", "")
-            shared["context"] = context + f"\n\n### Tool Call: {tool_name}\nParams: {tool_params}\nResult:\n{result}"
+            shared["context"] = context + f"\n\n### Tool Call: {tool_name}\nParams: {tool_params}\nResult:\n{result_str}"
+
+            # ========================================
+            # Manus-style: 2-动作规则 + 进度记录
+            # ========================================
+            if has_plan:
+                # 更新工具调用计数
+                tool_call_count = shared.get("tool_call_count", 0) + 1
+                shared["tool_call_count"] = tool_call_count
+
+                # 记录进度
+                append_to_progress(
+                    action_type="Tool Call",
+                    description=f"Called {tool_name}",
+                    tool_name=tool_name,
+                    result=result_str[:200]
+                )
+
+                # 2-动作规则：每 N 次工具调用后更新 findings
+                if tool_call_count % FINDINGS_UPDATE_INTERVAL == 0:
+                    finding_title = f"Tool Result: {tool_name}"
+                    append_to_findings(
+                        title=finding_title,
+                        source=f"Tool: {tool_name}",
+                        finding=result_str[:500],
+                        implications="Data collected for analysis"
+                    )
+                    print(f"   [Planning] Updated findings (2-action rule)")
+
+                # 更新阶段状态（工具调用 = Phase 1 信息收集）
+                update_plan_phase(1, completed=False)
 
         except Exception as e:
-            print(f"   [ERROR] Tool call failed: {e}")
-            shared["context"] += f"\n\n[Tool call failed: {tool_name} - {e}]"
+            error_msg = str(e)
+            print(f"   [ERROR] Tool call failed: {error_msg}")
+            shared["context"] += f"\n\n[Tool call failed: {tool_name} - {error_msg}]"
+
+            # Manus-style: 记录错误到计划文件（避免重复失败）
+            if has_plan:
+                record_error_in_plan(f"Tool {tool_name} failed: {error_msg[:100]}")
+                append_to_progress(
+                    action_type="Error",
+                    description=f"Tool call failed: {tool_name}",
+                    result=error_msg[:100]
+                )
 
         return Action.DECIDE
 
 
 class ThinkNode(AsyncNode):
     """
-    思考推理节点
+    思考推理节点 (含 Manus-style 进度记录)
 
     职责:
     - 分析已收集的信息
     - 生成中间结论
+    - 更新 Phase 2 进度
     """
 
     async def prep_async(self, shared):
@@ -605,6 +1242,7 @@ class ThinkNode(AsyncNode):
     async def post_async(self, shared, prep_res, exec_res):
         """保存思考结果"""
         print(f"   [Think] Processing...")
+        has_plan = shared.get("has_plan", False)
 
         # 处理空值
         if exec_res is None:
@@ -628,6 +1266,29 @@ class ThinkNode(AsyncNode):
         # 添加到上下文
         context = shared.get("context", "")
         shared["context"] = context + f"\n\n### Think Analysis\n{thinking_text}"
+
+        # ========================================
+        # Manus-style: 记录分析进度
+        # ========================================
+        if has_plan:
+            # 更新阶段状态（思考 = Phase 2 分析）
+            update_plan_phase(1, completed=True)  # 完成信息收集
+            update_plan_phase(2, completed=False)  # 进入分析阶段
+
+            # 记录分析到 findings
+            append_to_findings(
+                title="Analysis Result",
+                source="Think Node",
+                finding=thinking_text[:500],
+                implications="Intermediate conclusion formed"
+            )
+
+            # 记录进度
+            append_to_progress(
+                action_type="Analysis",
+                description="Performed analysis on collected data",
+                result=thinking_text[:100]
+            )
 
         return Action.DECIDE
 
@@ -770,12 +1431,14 @@ class EmbedNode(AsyncNode):
 
 class SupervisorNode(AsyncNode):
     """
-    答案质量监督节点
+    答案质量监督节点 (含 Manus-style 计划完成度检查)
 
     职责:
     - 检查 AnswerNode 生成的答案质量
+    - 检查计划完成度 (Manus-style)
     - 质量不合格则返回 DecideNode 重试
     - 超过最大重试次数则强制通过
+    - 任务完成后更新 Phase 4 并清理规划文件
     """
 
     async def prep_async(self, shared):
@@ -797,20 +1460,25 @@ class SupervisorNode(AsyncNode):
         # 获取重试计数
         retry_count = shared.get("supervisor_retry_count", 0)
 
+        # 获取计划状态
+        has_plan = shared.get("has_plan", False)
+
         return {
             "answer": latest_answer,
             "task": shared.get("current_task", ""),
-            "retry_count": retry_count
+            "retry_count": retry_count,
+            "has_plan": has_plan
         }
 
     async def exec_async(self, prep_res):
-        """检查答案质量"""
+        """检查答案质量（含计划完成度检查）"""
         if not prep_res:
             return {"valid": True, "reason": "No answer to check"}
 
         answer = prep_res["answer"]
         task = prep_res["task"]
         retry_count = prep_res["retry_count"]
+        has_plan = prep_res.get("has_plan", False)
 
         # 超过最大重试次数，强制通过
         if retry_count >= SUPERVISOR_MAX_RETRIES:
@@ -843,38 +1511,87 @@ class SupervisorNode(AsyncNode):
         if any(marker in answer.lower() for marker in incomplete_markers):
             issues.append("答案可能不完整")
 
+        # ========================================
+        # Manus-style: 检查计划完成度
+        # ========================================
+        plan_status = None
+        if has_plan:
+            completed, total, uncompleted = get_plan_completion_status()
+            plan_status = {"completed": completed, "total": total, "uncompleted": uncompleted}
+
+            # 如果关键阶段未完成，可以作为参考（但不强制拒绝）
+            if total > 0 and completed < total - 1:  # 允许最后一个验证阶段未完成
+                # 只记录，不作为拒绝理由（避免死循环）
+                print(f"   [Supervisor] Plan progress: {completed}/{total} phases")
+
         if issues:
             return {
                 "valid": False,
                 "reason": "; ".join(issues),
-                "forced": False
+                "forced": False,
+                "plan_status": plan_status
             }
 
         return {
             "valid": True,
             "reason": "答案质量检查通过",
-            "forced": False
+            "forced": False,
+            "plan_status": plan_status
         }
 
     async def post_async(self, shared, prep_res, exec_res):
-        """根据检查结果路由"""
+        """根据检查结果路由（含计划完成更新）"""
         if not exec_res:
             exec_res = {"valid": True, "reason": "No check result"}
 
         is_valid = exec_res.get("valid", True)
         reason = exec_res.get("reason", "")
         is_forced = exec_res.get("forced", False)
+        has_plan = shared.get("has_plan", False)
 
         if is_valid:
             if is_forced:
                 print(f"   [Supervisor] Force approved: {reason}")
             else:
                 print(f"   [Supervisor] Approved: {reason}")
+
+            # ========================================
+            # Manus-style: 更新计划完成状态
+            # ========================================
+            if has_plan:
+                # 标记 Phase 3 (Synthesis) 和 Phase 4 (Verification) 完成
+                update_plan_phase(2, completed=True)  # 分析完成
+                update_plan_phase(3, completed=True)  # 综合完成
+                update_plan_phase(4, completed=True)  # 验证完成
+
+                # 记录最终进度
+                append_to_progress(
+                    action_type="Task Completed",
+                    description="Answer approved by Supervisor",
+                    result="All phases completed"
+                )
+
+                # 显示最终计划状态
+                completed, total, _ = get_plan_completion_status()
+                print(f"   [Planning] Final status: {completed}/{total} phases completed")
+
+                # 清理规划文件（可选，保留用于调试）
+                # cleanup_planning_files()
+
             # 重置重试计数
             shared["supervisor_retry_count"] = 0
             return Action.EMBED
         else:
             print(f"   [Supervisor] Rejected: {reason}")
+
+            # Manus-style: 记录拒绝到计划文件
+            if has_plan:
+                record_error_in_plan(f"Answer rejected: {reason}")
+                append_to_progress(
+                    action_type="Rejection",
+                    description=f"Answer rejected by Supervisor: {reason}"
+                )
+
             # 增加重试计数
             retry_count = shared.get("supervisor_retry_count", 0) + 1
             shared["supervisor_retry_count"] = retry_count
