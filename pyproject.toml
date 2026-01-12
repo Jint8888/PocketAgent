@@ -1,0 +1,32 @@
+[project]
+name = "my-pocketflow"
+version = "0.2.0"
+description = "PocketFlow 学习项目 - 支持 MCP Agent 智能工具调用"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    # 核心依赖
+    "pocketflow>=0.0.1",       # PocketFlow 核心框架
+    "openai>=1.0.0",           # OpenAI API 客户端
+    "python-dotenv>=1.0.0",    # 环境变量管理
+    "litellm>=1.0.0",          # 多 LLM 提供商统一接口
+    # MCP Agent 依赖
+    "pyyaml>=6.0",             # YAML 解析（用于解析 LLM 响应）
+    "mcp>=1.0.0",              # MCP 客户端库（连接 MCP 服务器）
+    "httpx-sse>=0.4.0",        # SSE 客户端支持（MCP SSE 传输）
+    "numpy>=2.4.1",
+    "sentence-transformers>=5.2.0",
+]
+
+[project.optional-dependencies]
+# MCP 服务器开发（可选，仅在创建自己的 MCP 服务器时需要）
+# 安装方式: uv pip install -e ".[mcp-server]"
+mcp-server = [
+    "fastmcp>=2.0.0",          # MCP 服务器框架（创建 MCP 工具服务器）
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",           # 测试框架
+    "ruff>=0.4.0",             # 代码检查和格式化
+]
