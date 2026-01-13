@@ -76,9 +76,58 @@ def parse_yaml_response(response: str) -> dict:
         result = yaml.safe_load(yaml_str)
         if result is None:
             raise ValueError("YAML parse result is empty")
+
+        # 检查 answer 字段是否被 YAML 解析截断
+        # 如果 action 是 answer 且 answer 字段很短但原始内容很长，尝试恢复完整内容
+        if result.get("action") == "answer" and result.get("answer"):
+            answer = result["answer"]
+            # 检测可能的截断：answer 很短但 yaml_str 很长
+            if len(str(answer)) < 200 and len(yaml_str) > 300:
+                # 尝试用正则提取完整的 answer 内容
+                full_answer = _extract_full_answer(yaml_str)
+                if full_answer and len(full_answer) > len(str(answer)):
+                    result["answer"] = full_answer
+
         return result
     except Exception as e:
         raise ValueError(f"YAML parse failed: {e}")
+
+
+def _extract_full_answer(yaml_str: str) -> str | None:
+    """
+    从 YAML 字符串中直接提取完整的 answer 内容
+
+    当 YAML 解析器因格式问题截断多行文本时，使用正则表达式恢复完整内容。
+    """
+    # 方法1：匹配 answer: | 后的多行内容（带缩进）
+    match = re.search(r'answer:\s*\|\s*\n((?:[ \t]+.+\n?)+)', yaml_str)
+    if match:
+        # 移除每行的公共缩进
+        lines = match.group(1).split('\n')
+        if lines:
+            # 找到最小缩进
+            min_indent = float('inf')
+            for line in lines:
+                if line.strip():
+                    indent = len(line) - len(line.lstrip())
+                    min_indent = min(min_indent, indent)
+            if min_indent < float('inf'):
+                return '\n'.join(line[min_indent:] if len(line) > min_indent else line
+                                 for line in lines).strip()
+
+    # 方法2：匹配 answer: 后到文件末尾的所有内容（无 | 符号的情况）
+    match = re.search(r'answer:\s*\n([\s\S]+?)(?:\n\w+:|$)', yaml_str)
+    if match:
+        content = match.group(1).strip()
+        if content:
+            return content
+
+    # 方法3：单行 answer（可能被截断）
+    match = re.search(r'answer:\s*[|>]?\s*(.+)', yaml_str, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+
+    return None
 
 
 # ============================================================================
