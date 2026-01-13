@@ -24,6 +24,7 @@ warnings.filterwarnings("ignore", module="pydantic")
 
 DEFAULT_MODEL = "deepseek/deepseek-chat"
 DEFAULT_TEMPERATURE = 0.7
+DEFAULT_MAX_TOKENS = 4096  # 默认最大响应 token 数
 MAX_RETRIES = 3
 RETRY_DELAY_BASE = 2  # 指数退避基数（秒）
 
@@ -49,6 +50,7 @@ def call_llm(messages: List[Dict]) -> str:
     """
     model = os.environ.get("LLM_MODEL", DEFAULT_MODEL)
     temperature = float(os.environ.get("LLM_TEMPERATURE", str(DEFAULT_TEMPERATURE)))
+    max_tokens = int(os.environ.get("LLM_MAX_TOKENS", str(DEFAULT_MAX_TOKENS)))
 
     last_error: Optional[Exception] = None
 
@@ -57,7 +59,8 @@ def call_llm(messages: List[Dict]) -> str:
             response = completion(
                 model=model,
                 messages=messages,
-                temperature=temperature
+                temperature=temperature,
+                max_tokens=max_tokens
             )
             return response.choices[0].message.content
         except Exception as e:
@@ -91,6 +94,7 @@ async def call_llm_async(messages: List[Dict]) -> str:
     """
     model = os.environ.get("LLM_MODEL", DEFAULT_MODEL)
     temperature = float(os.environ.get("LLM_TEMPERATURE", str(DEFAULT_TEMPERATURE)))
+    max_tokens = int(os.environ.get("LLM_MAX_TOKENS", str(DEFAULT_MAX_TOKENS)))
 
     last_error: Optional[Exception] = None
 
@@ -99,7 +103,8 @@ async def call_llm_async(messages: List[Dict]) -> str:
             response = await acompletion(
                 model=model,
                 messages=messages,
-                temperature=temperature
+                temperature=temperature,
+                max_tokens=max_tokens
             )
             return response.choices[0].message.content
         except Exception as e:

@@ -20,6 +20,7 @@ Manus-style Planning Features:
 """
 
 import os
+import re
 import yaml
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -113,6 +114,14 @@ MEMORY_DEDUP_THRESHOLD = 0.85
 # Supervisor 最大重试次数（避免无限循环）
 SUPERVISOR_MAX_RETRIES = 2
 
+# 拒绝回复检测模式（更精确的正则表达式，减少误判）
+REJECT_PATTERNS = [
+    r"^(sorry|抱歉|对不起)[,，]?\s*(i\s*)?(cannot|can't|couldn't|无法|不能)",
+    r"^(i\s*)?(cannot|can't|couldn't|无法|不能).{0,30}(sorry|抱歉)",
+    r"^(unable|无法)\s+to\s+",
+    r"^(i\s+)?(don't|do not|没有|不)\s+(have|know|了解|知道)",
+]
+
 # ============================================================================
 # Manus-style Planning 配置
 # ============================================================================
@@ -125,13 +134,47 @@ PLAN_FILE = "task_plan.md"
 FINDINGS_FILE = "findings.md"
 PROGRESS_FILE = "progress.md"
 
-# 复杂任务判定阈值（关键词数量或长度）
-COMPLEX_TASK_MIN_LENGTH = 20
+# 复杂任务判定阈值
+COMPLEX_TASK_MIN_LENGTH = 15  # 降低阈值，更多任务会被认为是复杂任务
+
+# 复杂任务关键词（按类别组织）
 COMPLEX_TASK_KEYWORDS = [
-    "分析", "比较", "研究", "调查", "评估", "总结",
+    # 分析类动词
+    "分析", "比较", "研究", "调查", "评估", "总结", "解读", "解析", "诊断",
     "analyze", "compare", "research", "investigate", "evaluate", "summarize",
-    "多个", "几个", "所有", "multiple", "several", "all",
-    "步骤", "流程", "方案", "steps", "process", "plan"
+
+    # 建议/推荐类
+    "建议", "推荐", "评级", "评价", "判断", "预测", "展望",
+    "suggest", "recommend", "rate", "rating", "predict", "forecast",
+
+    # 数量词（暗示多步骤）
+    "多个", "几个", "所有", "各个", "每个", "一系列",
+    "multiple", "several", "all", "each", "various",
+
+    # 流程/规划类
+    "步骤", "流程", "方案", "计划", "策略", "规划",
+    "steps", "process", "plan", "strategy", "procedure",
+
+    # 金融/投资领域（通常需要数据获取+分析）
+    "股价", "行情", "走势", "涨跌", "买入", "卖出", "持有",
+    "K线", "均线", "指标", "估值", "市盈率", "市值",
+    "stock", "price", "trend", "buy", "sell", "hold",
+
+    # 数据处理类
+    "统计", "汇总", "整理", "对比", "排序", "筛选",
+    "statistics", "aggregate", "sort", "filter",
+
+    # 问题解决类
+    "怎么", "如何", "为什么", "什么原因", "怎样",
+    "how", "why", "what cause",
+]
+
+# 复杂任务句式模式（正则表达式）
+COMPLEX_TASK_PATTERNS = [
+    r"给.{0,10}(建议|推荐|评级|分析)",  # "给xxx建议"
+    r"(帮我|请|麻烦).{0,15}(分析|研究|查|找|整理)",  # "帮我分析xxx"
+    r"\d{6}.{0,10}(股|价|行情|走势|建议)",  # 股票代码 + 相关词
+    r"(对比|比较).{0,10}(和|与|跟)",  # "对比A和B"
 ]
 
 # 2-动作规则：每 N 次工具调用后更新 findings
@@ -248,8 +291,8 @@ def update_plan_phase(phase_num: int, completed: bool = False) -> bool:
 
         # 更新当前阶段
         if not completed:
-            import re
-            content = re.sub(r"## Current Phase\n.*", f"## Current Phase\nPhase {phase_num}", content)
+            # 使用 [^\n]* 替代 .* 避免贪婪匹配跨行
+            content = re.sub(r"## Current Phase\n[^\n]*", f"## Current Phase\nPhase {phase_num}", content)
 
         return write_planning_file(PLAN_FILE, content)
     return False
@@ -322,7 +365,6 @@ def get_plan_completion_status() -> tuple[int, int, list[str]]:
     if not content:
         return 0, 0, []
 
-    import re
     completed = len(re.findall(r"- \[x\] Phase \d+:", content))
     total = len(re.findall(r"- \[.\] Phase \d+:", content))
 
@@ -333,15 +375,32 @@ def get_plan_completion_status() -> tuple[int, int, list[str]]:
 
 
 def is_complex_task(task: str) -> bool:
-    """判断是否为复杂任务，需要创建规划文件"""
-    # 长度检查
+    """
+    判断是否为复杂任务，需要创建规划文件
+
+    判断条件（满足任一即为复杂任务）：
+    1. 任务长度 >= 15 字符
+    2. 包含复杂任务关键词
+    3. 匹配复杂任务句式模式（正则）
+
+    Returns:
+        True: 复杂任务，需要创建规划文件
+        False: 简单任务，跳过规划
+    """
+    # 条件1: 长度检查
     if len(task) >= COMPLEX_TASK_MIN_LENGTH:
         return True
 
-    # 关键词检查
     task_lower = task.lower()
+
+    # 条件2: 关键词检查
     for keyword in COMPLEX_TASK_KEYWORDS:
-        if keyword in task_lower:
+        if keyword.lower() in task_lower:
+            return True
+
+    # 条件3: 句式模式匹配（正则表达式）
+    for pattern in COMPLEX_TASK_PATTERNS:
+        if re.search(pattern, task, re.IGNORECASE):
             return True
 
     return False
@@ -871,8 +930,6 @@ Reply in YAML format."""
 
     def _extract_plan_summary(self, plan_content: str) -> str:
         """从计划文件中提取关键摘要"""
-        import re
-
         summary_parts = []
 
         # 提取目标
@@ -1364,13 +1421,28 @@ class EmbedNode(AsyncNode):
         if len(messages) <= MEMORY_WINDOW_SIZE:
             return None
 
-        # 取出最旧的一对对话 (user + assistant)
-        oldest_pair = messages[:2]
+        # 寻找完整的对话轮次（user + assistant）
+        # 不再假设消息总是成对出现
+        user_msg = None
+        assistant_msg = None
+        consumed_count = 0
 
-        # 从 messages 中移除
-        shared["messages"] = messages[2:]
+        for i, msg in enumerate(messages):
+            role = msg.get("role", "")
+            if role == "user" and user_msg is None:
+                user_msg = msg
+                consumed_count = i + 1
+            elif role == "assistant" and user_msg is not None:
+                assistant_msg = msg
+                consumed_count = i + 1
+                break  # 找到完整的一轮对话
 
-        return oldest_pair
+        # 只有找到完整的 user + assistant 对话才存储
+        if user_msg and assistant_msg:
+            shared["messages"] = messages[consumed_count:]
+            return [user_msg, assistant_msg]
+
+        return None
 
     async def exec_async(self, prep_res):
         """生成对话的嵌入向量"""
@@ -1495,11 +1567,14 @@ class SupervisorNode(AsyncNode):
         if len(answer) < 20:
             issues.append("答案过短")
 
-        # 检查2: 拒绝性关键词 (仅当答案很短时才判定为拒绝)
-        reject_keywords = ["sorry", "cannot", "unable", "无法", "抱歉", "不能"]
-        if any(kw in answer.lower() for kw in reject_keywords):
-            if len(answer) < 80:  # 短回复 + 拒绝词 = 可能是拒绝
-                issues.append("答案可能是拒绝回复")
+        # 检查2: 拒绝模式检测（使用正则表达式，更精确）
+        # 只在短回复时检测，避免误判详细回答中包含的道歉词
+        if len(answer) < 120:
+            answer_start = answer[:200].lower().strip()
+            for pattern in REJECT_PATTERNS:
+                if re.search(pattern, answer_start, re.IGNORECASE):
+                    issues.append("答案可能是拒绝回复")
+                    break
 
         # 检查3: 错误标记 (仅检查明确的错误前缀，避免误判正常讨论错误的回答)
         error_patterns = ["[error]", "[错误]", "error:", "错误:", "failed:", "失败:"]

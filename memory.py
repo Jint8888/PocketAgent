@@ -5,6 +5,7 @@
 使用本地 Sentence Transformers 进行向量检索。
 """
 
+import os
 import numpy as np
 from typing import List, Tuple, Optional
 from dotenv import load_dotenv
@@ -77,6 +78,10 @@ def get_embedding(text: str) -> np.ndarray:
 # 向量索引相关
 # ============================================================================
 
+# 性能警告阈值
+MEMORY_SIZE_WARNING_THRESHOLD = 5000
+
+
 class SimpleVectorIndex:
     """
     简单的向量索引实现
@@ -118,6 +123,11 @@ class SimpleVectorIndex:
         """
         if not self.vectors:
             return []
+
+        # 性能警告：线性搜索在大数据量时会变慢
+        if len(self.vectors) > MEMORY_SIZE_WARNING_THRESHOLD:
+            print(f"[WARN] Memory index has {len(self.vectors)} items, "
+                  f"search may be slow. Consider upgrading to FAISS.")
 
         query = query_vector.flatten()
 
@@ -210,16 +220,39 @@ class SimpleVectorIndex:
 
 
     def save(self, filepath: str):
-        """保存索引到文件"""
+        """
+        保存索引到文件（原子性写入）
+
+        使用临时文件 + 重命名的方式，确保写入过程中程序崩溃不会损坏数据。
+        """
         import json
+        import tempfile
+        import shutil
+
         data = {
             "dimension": self.dimension,
             "vectors": [v.tolist() for v in self.vectors],
             "items": self.items
         }
-        with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        print(f"[OK] Memory saved: {filepath}")
+
+        # 获取目标目录（确保临时文件和目标文件在同一文件系统）
+        abs_filepath = os.path.abspath(filepath)
+        dir_path = os.path.dirname(abs_filepath) or '.'
+
+        # 先写入临时文件
+        fd, temp_path = tempfile.mkstemp(suffix='.tmp', dir=dir_path)
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            # 原子性重命名（同一文件系统内是原子操作）
+            shutil.move(temp_path, abs_filepath)
+            print(f"[OK] Memory saved: {filepath}")
+        except Exception as e:
+            # 清理临时文件
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            print(f"[ERROR] Failed to save memory: {e}")
+            raise
 
     def load(self, filepath: str) -> bool:
         """从文件加载索引"""

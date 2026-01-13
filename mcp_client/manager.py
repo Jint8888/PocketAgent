@@ -37,6 +37,45 @@ from typing import Dict, List, Any, Optional, Literal
 
 
 # ============================================================================
+# 安全环境变量白名单
+# ============================================================================
+
+SAFE_ENV_VARS = [
+    # 系统必需
+    "PATH", "HOME", "USER", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TERM",
+    # Windows 必需
+    "SYSTEMROOT", "SYSTEMDRIVE", "TEMP", "TMP", "USERPROFILE",
+    "APPDATA", "LOCALAPPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)",
+    "COMMONPROGRAMFILES", "COMSPEC", "WINDIR", "PATHEXT",
+    # Node.js / Python 运行时
+    "NODE_PATH", "NODE_ENV", "PYTHONPATH", "VIRTUAL_ENV", "CONDA_PREFIX",
+    # 代理设置（某些工具需要）
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "no_proxy",
+]
+
+
+# ============================================================================
+# 工具 Schema 补丁（用于修复已知有问题的工具 schema）
+# ============================================================================
+
+TOOL_SCHEMA_PATCHES: Dict[str, Dict[str, Any]] = {
+    # 修复 xueqiu fetch_stock_quote 缺少参数的问题
+    "fetch_stock_quote": {
+        "type": "object",
+        "properties": {
+            "symbol": {
+                "type": "string",
+                "description": "Stock symbol (e.g., SH600016, SZ000001)"
+            }
+        },
+        "required": ["symbol"]
+    },
+    # 可以在此添加更多工具的 schema 修复
+}
+
+
+# ============================================================================
 # 数据类定义
 # ============================================================================
 
@@ -204,22 +243,18 @@ class MCPManager:
         return all_tools
 
     def _patch_tool_schema(self, tools: List[Tool]):
-        """手动修复某些工具的 schema 问题"""
+        """
+        修复已知有问题的工具 schema
+
+        使用 TOOL_SCHEMA_PATCHES 常量中定义的补丁，
+        只有当工具的 input_schema 为空或缺少 properties 时才应用。
+        """
         for tool in tools:
-            # 修复 xueqiu fetch_stock_quote 缺少参数的问题
-            # 只有当 input_schema 为空或者缺少 properties 时才修复
-            if tool.name == "fetch_stock_quote" and (not tool.input_schema or "properties" not in tool.input_schema):
-                print(f"🔧 [Fix] 自动修复工具 schema: {tool.name}")
-                tool.input_schema = {
-                    "type": "object",
-                    "properties": {
-                        "symbol": {
-                            "type": "string",
-                            "description": "Stock symbol (e.g., SH600016, SZ000001)"
-                        }
-                    },
-                    "required": ["symbol"]
-                }
+            if tool.name in TOOL_SCHEMA_PATCHES:
+                # 只在 schema 缺失或不完整时修复
+                if not tool.input_schema or "properties" not in tool.input_schema:
+                    print(f"   [Fix] Auto-patching schema for: {tool.name}")
+                    tool.input_schema = TOOL_SCHEMA_PATCHES[tool.name]
 
     async def _get_tools_stdio_async(self, server_name: str) -> List[Tool]:
         """【异步】通过 stdio 协议获取工具"""
@@ -237,7 +272,7 @@ class MCPManager:
             server_params = StdioServerParameters(
                 command=config.command,
                 args=config.args,
-                env={**os.environ, **config.env}
+                env=self._get_safe_env(config.env)
             )
 
             # 使用 async with 管理连接生命周期
@@ -344,14 +379,14 @@ class MCPManager:
             server_params = StdioServerParameters(
                 command=config.command,
                 args=config.args,
-                env={**os.environ, **config.env}
+                env=self._get_safe_env(config.env)
             )
 
             async with stdio_client(server_params) as (read, write):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
                     result = await session.call_tool(tool_name, arguments)
-                    return result.content[0].text
+                    return self._extract_tool_result(result)
 
         # 使用 asyncio.wait_for 实现超时控制
         try:
@@ -373,7 +408,7 @@ class MCPManager:
                 async with ClientSession(read, write) as session:
                     await session.initialize()
                     result = await session.call_tool(tool_name, arguments)
-                    return result.content[0].text
+                    return self._extract_tool_result(result)
 
         try:
             return await asyncio.wait_for(_call(), timeout=config.timeout)
@@ -384,17 +419,86 @@ class MCPManager:
     # 同步 API (兼容旧代码，内部调用异步方法)
     # ========================================================================
 
+    def _get_safe_env(self, config_env: Dict[str, str]) -> Dict[str, str]:
+        """
+        获取安全的环境变量子集
+
+        只传递白名单中的系统环境变量，避免泄露敏感信息（如 API keys）。
+        配置文件中明确指定的变量会被添加（用户显式授权）。
+        """
+        safe_env = {}
+
+        for key in SAFE_ENV_VARS:
+            # 直接匹配
+            if key in os.environ:
+                safe_env[key] = os.environ[key]
+            # Windows 环境变量不区分大小写，尝试大写匹配
+            elif key.upper() in os.environ:
+                safe_env[key] = os.environ[key.upper()]
+
+        # 配置文件中的变量覆盖/添加（这些是用户明确指定的，可信任）
+        safe_env.update(config_env)
+
+        return safe_env
+
+    def _run_sync(self, coro):
+        """
+        安全地在同步上下文中运行协程
+
+        处理已有事件循环运行的情况（如 Jupyter Notebook、某些 Web 框架）。
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # 没有运行中的事件循环，安全使用 asyncio.run
+            return asyncio.run(coro)
+        else:
+            # 已有事件循环，创建新线程执行
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(asyncio.run, coro)
+                return future.result()
+
     def get_all_tools(self) -> List[Tool]:
-        """【同步】从所有服务器获取工具 (内部使用 asyncio.run)"""
-        return asyncio.run(self.get_all_tools_async())
+        """【同步】从所有服务器获取工具"""
+        return self._run_sync(self.get_all_tools_async())
 
     def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Any:
-        """【同步】调用工具 (内部使用 asyncio.run)"""
-        return asyncio.run(self.call_tool_async(tool_name, arguments))
+        """【同步】调用工具"""
+        return self._run_sync(self.call_tool_async(tool_name, arguments))
 
     # ========================================================================
     # 辅助方法
     # ========================================================================
+
+    def _extract_tool_result(self, result) -> str:
+        """
+        安全提取工具调用结果
+
+        处理各种可能的返回格式：文本、二进制数据、空结果等。
+        """
+        if not result.content:
+            return '{"error": "Tool returned empty content"}'
+
+        first_content = result.content[0]
+
+        # 尝试获取文本内容
+        if hasattr(first_content, 'text') and first_content.text is not None:
+            return first_content.text
+
+        # 尝试获取二进制数据
+        if hasattr(first_content, 'data') and first_content.data is not None:
+            import base64
+            data_len = len(first_content.data)
+            preview = base64.b64encode(first_content.data[:100]).decode() if data_len > 0 else ""
+            return f'{{"type": "binary", "size": {data_len}, "preview": "{preview}..."}}'
+
+        # 尝试获取 blob 类型
+        if hasattr(first_content, 'blob') and first_content.blob is not None:
+            return f'{{"type": "blob", "mimeType": "{getattr(first_content, "mimeType", "unknown")}"}}'
+
+        # 兜底：转换为字符串
+        return str(first_content)
 
     def format_tools_for_prompt(self) -> str:
         """将工具信息格式化为 LLM 可理解的文本（按服务器分组）"""
