@@ -52,6 +52,66 @@ class Action:
 # 辅助函数
 # ============================================================================
 
+def _extract_yaml_block(response: str) -> str:
+    """
+    智能提取 YAML 代码块，正确处理嵌套的 ``` 标记
+
+    LLM 返回的 answer 字段可能包含 markdown 代码块（如 ```json），
+    简单的 split("```") 会错误截断。此函数通过计算嵌套层级来正确提取。
+    """
+    if not response:
+        return ""
+
+    # 查找 ```yaml 或 ``` 开始位置
+    start_marker = "```yaml"
+    start_idx = response.find(start_marker)
+    if start_idx == -1:
+        start_marker = "```"
+        start_idx = response.find(start_marker)
+        if start_idx == -1:
+            return response
+
+    # 跳过开始标记
+    content_start = start_idx + len(start_marker)
+    # 跳过开始标记后的换行
+    if content_start < len(response) and response[content_start] == '\n':
+        content_start += 1
+
+    # 查找配对的结束 ```
+    # 策略：从内容开始位置向后搜索，跟踪嵌套的代码块
+    content = response[content_start:]
+    nesting_level = 0
+    i = 0
+    while i < len(content):
+        # 检查是否是 ``` 标记（可能带语言标识符）
+        if content[i:i+3] == "```":
+            # 检查是否在行首或前面是换行
+            is_line_start = (i == 0) or (content[i-1] == '\n')
+            if is_line_start:
+                # 检查这是开始标记还是结束标记
+                # 如果 ``` 后面跟着字母（语言名），是开始标记
+                rest = content[i+3:]
+                if rest and (rest[0].isalpha() or rest[0] == '\n' or rest[0] == ' '):
+                    if rest[0].isalpha():
+                        nesting_level += 1
+                    elif nesting_level > 0:
+                        nesting_level -= 1
+                    else:
+                        # 找到了配对的结束标记
+                        return content[:i].strip()
+                elif nesting_level > 0:
+                    nesting_level -= 1
+                else:
+                    # 找到了配对的结束标记
+                    return content[:i].strip()
+            i += 3
+        else:
+            i += 1
+
+    # 如果没找到结束标记，返回全部内容
+    return content.strip()
+
+
 def parse_yaml_response(response: str) -> dict:
     """
     解析 LLM 返回的 YAML 格式响应
@@ -66,22 +126,17 @@ def parse_yaml_response(response: str) -> dict:
         ValueError: YAML 解析失败时抛出
     """
     try:
-        if response and "```yaml" in response:
-            yaml_str = response.split("```yaml")[1].split("```")[0].strip()
-        elif response and "```" in response:
-            yaml_str = response.split("```")[1].split("```")[0].strip()
-        else:
-            yaml_str = response or ""
+        # 使用智能提取，正确处理嵌套的代码块
+        yaml_str = _extract_yaml_block(response)
 
         result = yaml.safe_load(yaml_str)
         if result is None:
             raise ValueError("YAML parse result is empty")
 
-        # 检查 answer 字段是否被 YAML 解析截断
-        # 总是尝试从原始 YAML 中提取完整内容，选择更长的版本
+        # 备用：检查 answer 字段是否被 YAML 解析截断（防御性代码）
+        # 正常情况下 _extract_yaml_block 已经正确处理了嵌套代码块
         if result.get("action") == "answer":
             parsed_answer = str(result.get("answer", ""))
-            # 尝试用正则提取完整的 answer 内容
             full_answer = _extract_full_answer(yaml_str)
             if full_answer and len(full_answer) > len(parsed_answer):
                 print(f"   [YAML] Recovered truncated answer: {len(parsed_answer)} -> {len(full_answer)} chars")
