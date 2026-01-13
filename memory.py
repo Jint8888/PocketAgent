@@ -94,6 +94,7 @@ class SimpleVectorIndex:
         self.dimension = dimension
         self.vectors: List[np.ndarray] = []
         self.items: List[dict] = []
+        self._warned_size = False  # 避免重复打印性能警告
 
     def add(self, vector: np.ndarray, item: dict) -> int:
         """
@@ -124,10 +125,11 @@ class SimpleVectorIndex:
         if not self.vectors:
             return []
 
-        # 性能警告：线性搜索在大数据量时会变慢
-        if len(self.vectors) > MEMORY_SIZE_WARNING_THRESHOLD:
+        # 性能警告：线性搜索在大数据量时会变慢（只警告一次）
+        if len(self.vectors) > MEMORY_SIZE_WARNING_THRESHOLD and not self._warned_size:
             print(f"[WARN] Memory index has {len(self.vectors)} items, "
                   f"search may be slow. Consider upgrading to FAISS.")
+            self._warned_size = True
 
         query = query_vector.flatten()
 

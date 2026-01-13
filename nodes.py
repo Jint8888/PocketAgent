@@ -1501,6 +1501,7 @@ class EmbedNode(AsyncNode):
 
         return Action.INPUT
 
+
 class SupervisorNode(AsyncNode):
     """
     答案质量监督节点 (含 Manus-style 计划完成度检查)
