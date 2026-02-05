@@ -24,11 +24,6 @@ dependencies = [
 mcp-server = [
     "fastmcp>=2.0.0",          # MCP 服务器框架（创建 MCP 工具服务器）
 ]
-# MCP 工具服务器（可选，预安装避免 uvx 超时）
-# 安装方式: uv pip install -e ".[mcp-tools]"
-mcp-tools = [
-    "code-execution-mcp",      # 代码执行服务（终端命令和 Python 运行）
-]
 
 [dependency-groups]
 dev = [
