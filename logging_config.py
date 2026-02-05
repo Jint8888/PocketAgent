@@ -79,7 +79,7 @@ def is_logging_enabled() -> bool:
 
 def setup_logging(
     logger_name: str = "agent",
-    level: str = None,
+    level: str | None = None,
     console_output: bool = True,
     file_output: bool = True
 ) -> logging.Logger:
@@ -310,6 +310,15 @@ def clean_old_logs(days: int = 7):
         logger.info(f"Cleaned {cleaned_count} old log files")
 
 
+def _count_lines(filepath: Path) -> int:
+    """安全地计算文件行数（使用 with 语句避免资源泄漏）"""
+    try:
+        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+            return sum(1 for _ in f)
+    except Exception:
+        return 0
+
+
 def get_log_summary():
     """
     获取日志文件摘要信息
@@ -324,7 +333,7 @@ def get_log_summary():
         summary[log_file.name] = {
             "size_mb": round(stat.st_size / 1024 / 1024, 2),
             "modified": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
-            "lines": sum(1 for _ in open(log_file, 'r', encoding='utf-8', errors='ignore'))
+            "lines": _count_lines(log_file)
         }
 
     return summary

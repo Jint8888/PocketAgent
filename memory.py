@@ -7,6 +7,7 @@
 
 import os
 import numpy as np
+import threading
 from typing import List, Tuple, Optional
 from dotenv import load_dotenv
 
@@ -23,6 +24,7 @@ DEFAULT_MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
 
 # 全局模型实例（懒加载）
 _embedding_model = None
+_embedding_lock = threading.Lock()  # 线程安全锁
 
 
 def get_hf_endpoint() -> str:
@@ -48,30 +50,34 @@ def get_embedding_model_name() -> str:
 
 
 def _get_embedding_model():
-    """获取 Sentence Transformer 模型单例
+    """获取 Sentence Transformer 模型单例（线程安全）
 
     使用多语言模型 paraphrase-multilingual-MiniLM-L12-v2，
     对中文语义理解比英文模型 all-MiniLM-L6-v2 好很多。
     测试结果: 中文语义匹配准确率从 28.6% 提升到 100%
 
     自动配置国内镜像以解决网络超时问题。
+    使用双重检查锁定模式确保线程安全。
     """
     global _embedding_model
     if _embedding_model is None:
-        from sentence_transformers import SentenceTransformer
+        with _embedding_lock:
+            # 双重检查锁定（Double-Checked Locking）
+            if _embedding_model is None:
+                from sentence_transformers import SentenceTransformer
 
-        # 配置 HuggingFace 镜像端点（解决国内网络超时问题）
-        hf_endpoint = get_hf_endpoint()
-        os.environ["HF_ENDPOINT"] = hf_endpoint
+                # 配置 HuggingFace 镜像端点（解决国内网络超时问题）
+                hf_endpoint = get_hf_endpoint()
+                os.environ["HF_ENDPOINT"] = hf_endpoint
 
-        model_name = get_embedding_model_name()
+                model_name = get_embedding_model_name()
 
-        print(f"[INFO] Loading Embedding model...")
-        print(f"[INFO] HF_ENDPOINT: {hf_endpoint}")
+                print(f"[INFO] Loading Embedding model...")
+                print(f"[INFO] HF_ENDPOINT: {hf_endpoint}")
 
-        # 多语言模型，中文语义理解更准确
-        _embedding_model = SentenceTransformer(model_name)
-        print(f"[OK] Embedding model loaded ({model_name})")
+                # 多语言模型，中文语义理解更准确
+                _embedding_model = SentenceTransformer(model_name)
+                print(f"[OK] Embedding model loaded ({model_name})")
     return _embedding_model
 
 
@@ -86,8 +92,12 @@ async def get_embedding_async(text: str) -> np.ndarray:
 
     Returns:
         384 维的 numpy 数组
+
+    Raises:
+        VectorMemoryError: 当嵌入失败时抛出（不再静默返回零向量）
     """
     import asyncio
+    from exceptions import VectorMemoryError
 
     # sentence-transformers 是同步的，用线程池包装
     loop = asyncio.get_running_loop()
@@ -100,16 +110,32 @@ async def get_embedding_async(text: str) -> np.ndarray:
         embedding = await loop.run_in_executor(None, _encode)
         return embedding.astype(np.float32)
     except Exception as e:
-        print(f"[ERROR] Embedding failed: {e}")
-        return np.zeros(384, dtype=np.float32)
+        # 显式抛出异常，不再静默返回零向量
+        raise VectorMemoryError(
+            operation="embedding",
+            reason=str(e),
+            context={"text_preview": text[:100] if len(text) > 100 else text}
+        )
 
 
 def get_embedding(text: str) -> np.ndarray:
     """
     同步获取文本的向量嵌入
+
+    Raises:
+        VectorMemoryError: 当嵌入失败时抛出
     """
-    model = _get_embedding_model()
-    return model.encode(text, convert_to_numpy=True).astype(np.float32)
+    from exceptions import VectorMemoryError
+
+    try:
+        model = _get_embedding_model()
+        return model.encode(text, convert_to_numpy=True).astype(np.float32)
+    except Exception as e:
+        raise VectorMemoryError(
+            operation="embedding",
+            reason=str(e),
+            context={"text_preview": text[:100] if len(text) > 100 else text}
+        )
 
 
 # ============================================================================
@@ -314,13 +340,21 @@ class SimpleVectorIndex:
 
 # 全局记忆索引
 _memory_index: Optional[SimpleVectorIndex] = None
+_memory_index_lock = threading.Lock()  # 线程安全锁
+
 
 def get_memory_index() -> SimpleVectorIndex:
-    """获取全局记忆索引单例"""
+    """获取全局记忆索引单例（线程安全）
+
+    使用双重检查锁定模式确保线程安全。
+    """
     global _memory_index
     if _memory_index is None:
-        _memory_index = SimpleVectorIndex(dimension=384)
-        # 尝试从文件加载
-        _memory_index.load("memory_index.json")
+        with _memory_index_lock:
+            # 双重检查锁定（Double-Checked Locking）
+            if _memory_index is None:
+                _memory_index = SimpleVectorIndex(dimension=384)
+                # 尝试从文件加载
+                _memory_index.load("memory_index.json")
     return _memory_index
 

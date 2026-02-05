@@ -8,6 +8,9 @@ ToolNode - 工具执行节点 (含 Manus-style 2-动作规则)
 - 记录进度到 progress.md
 """
 
+import subprocess
+import sys
+import os
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from pocketflow import AsyncNode
@@ -31,6 +34,29 @@ from .planning_utils import (
 
 # 导入日志系统
 from logging_config import log_tool_call, log_tool_result, log_error
+
+
+# ============================================================================
+# 内置代码执行工具配置
+# ============================================================================
+
+# 项目虚拟环境的 Python 路径
+PROJECT_PYTHON = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    ".venv", "Scripts", "python.exe"
+)
+# 如果 Windows 路径不存在，尝试 Linux/Mac 路径
+if not os.path.exists(PROJECT_PYTHON):
+    PROJECT_PYTHON = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        ".venv", "bin", "python"
+    )
+# 如果还是不存在，使用系统 Python
+if not os.path.exists(PROJECT_PYTHON):
+    PROJECT_PYTHON = sys.executable
+
+# 代码执行超时（秒）
+CODE_EXECUTION_TIMEOUT = 120
 
 
 class ToolNode(AsyncNode):
@@ -204,11 +230,126 @@ class ToolNode(AsyncNode):
             return Action.DECIDE
 
         # ========================================
+        # 内置工具: execute_python - 本地执行 Python 代码
+        # 使用项目虚拟环境，可访问 akshare 等已安装库
+        # ========================================
+        if tool_name == "execute_python":
+            code = tool_params.get("code", "")
+            if not code:
+                result_str = "Error: code parameter is required"
+                print(f"   [ERROR] {result_str}")
+            else:
+                try:
+                    # 使用项目虚拟环境的 Python 执行代码
+                    result = subprocess.run(
+                        [PROJECT_PYTHON, "-c", code],
+                        capture_output=True,
+                        text=True,
+                        timeout=CODE_EXECUTION_TIMEOUT,
+                        encoding='utf-8',
+                        errors='replace',
+                        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                    )
+
+                    output_parts = []
+                    if result.stdout:
+                        output_parts.append(result.stdout)
+                    if result.stderr:
+                        output_parts.append(f"[STDERR] {result.stderr}")
+                    if result.returncode != 0:
+                        output_parts.append(f"[Exit Code: {result.returncode}]")
+
+                    result_str = "\n".join(output_parts) if output_parts else "(No output)"
+
+                except subprocess.TimeoutExpired:
+                    result_str = f"[ERROR] Code execution timed out after {CODE_EXECUTION_TIMEOUT} seconds"
+                except Exception as e:
+                    result_str = f"[ERROR] {str(e)}"
+
+            # 记录工具结果到日志
+            log_tool_result(tool_name, True, result_str[:500] if len(result_str) > 500 else result_str)
+
+            # 截断过大的结果
+            if len(result_str) > MAX_TOOL_RESULT_LENGTH:
+                result_str = result_str[:MAX_TOOL_RESULT_LENGTH] + f"\n... (truncated)"
+
+            # 添加到上下文
+            context = shared.get("context", "")
+            shared["context"] = context + f"\n\n### Tool Call: {tool_name} (Built-in)\nCode:\n```python\n{code[:500]}{'...' if len(code) > 500 else ''}\n```\nResult:\n{result_str}"
+
+            # Manus-style 进度记录
+            if has_plan:
+                append_to_progress(
+                    action_type="Built-in Tool",
+                    description=f"Executed Python code",
+                    result=result_str[:200]
+                )
+
+            return Action.DECIDE
+
+        # ========================================
+        # 内置工具: execute_terminal - 本地执行终端命令
+        # 使用 subprocess 执行 shell 命令
+        # ========================================
+        if tool_name == "execute_terminal":
+            command = tool_params.get("command", "")
+            if not command:
+                result_str = "Error: command parameter is required"
+                print(f"   [ERROR] {result_str}")
+            else:
+                try:
+                    result = subprocess.run(
+                        command,
+                        shell=True,
+                        capture_output=True,
+                        text=True,
+                        timeout=CODE_EXECUTION_TIMEOUT,
+                        encoding='utf-8',
+                        errors='replace',
+                        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                    )
+
+                    output_parts = []
+                    if result.stdout:
+                        output_parts.append(result.stdout)
+                    if result.stderr:
+                        output_parts.append(f"[STDERR] {result.stderr}")
+                    if result.returncode != 0:
+                        output_parts.append(f"[Exit Code: {result.returncode}]")
+
+                    result_str = "\n".join(output_parts) if output_parts else "(No output)"
+
+                except subprocess.TimeoutExpired:
+                    result_str = f"[ERROR] Command timed out after {CODE_EXECUTION_TIMEOUT} seconds"
+                except Exception as e:
+                    result_str = f"[ERROR] {str(e)}"
+
+            # 记录工具结果到日志
+            log_tool_result(tool_name, True, result_str[:500] if len(result_str) > 500 else result_str)
+
+            # 截断过大的结果
+            if len(result_str) > MAX_TOOL_RESULT_LENGTH:
+                result_str = result_str[:MAX_TOOL_RESULT_LENGTH] + f"\n... (truncated)"
+
+            # 添加到上下文
+            context = shared.get("context", "")
+            shared["context"] = context + f"\n\n### Tool Call: {tool_name} (Built-in)\nCommand: {command}\nResult:\n{result_str}"
+
+            # Manus-style 进度记录
+            if has_plan:
+                append_to_progress(
+                    action_type="Built-in Tool",
+                    description=f"Executed: {command[:50]}",
+                    result=result_str[:200]
+                )
+
+            return Action.DECIDE
+
+        # ========================================
         # MCP 工具处理
         # ========================================
         manager = shared.get("mcp_manager")
         if not manager:
-            print("   [ERROR] MCP Manager not initialized")
             shared["context"] += "\n\n[Tool call failed: MCP Manager not initialized]"
             # 记录错误到计划文件
             if shared.get("has_plan"):

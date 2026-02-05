@@ -90,11 +90,14 @@ class MCPToolError(MCPError):
 # 记忆系统异常
 # ============================================================================
 
-class MemoryError(PocketAgentError):
+class VectorMemoryError(PocketAgentError):
     """
-    记忆系统错误
+    向量记忆系统错误
 
     当向量记忆操作失败时抛出。
+
+    注意：使用 VectorMemoryError 而非 MemoryError，
+    避免与 Python 内置的 MemoryError 冲突。
 
     Examples:
         - 嵌入模型加载失败
@@ -108,6 +111,10 @@ class MemoryError(PocketAgentError):
         super().__init__(f"Memory {operation} failed: {reason}", ctx)
         self.operation = operation
         self.reason = reason
+
+
+# 向后兼容别名（将在未来版本中移除）
+MemoryError = VectorMemoryError
 
 
 # ============================================================================
