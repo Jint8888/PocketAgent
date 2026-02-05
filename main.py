@@ -8,6 +8,7 @@ MCP Agent 聊天机器人 (多步推理版本 + Manus-style Planning)
 - 复杂任务分解与执行
 - 向量记忆检索与存储 (滑动窗口 + 长期记忆)
 - Manus-style Planning: 三文件模式 (task_plan.md, findings.md, progress.md)
+- 完善的日志系统（logs/ 目录）
 
 Manus-style Features:
 - 复杂任务自动创建规划文件
@@ -23,6 +24,14 @@ Manus-style Features:
 import asyncio
 import warnings
 from pocketflow import AsyncFlow
+
+# 导入日志系统
+from logging_config import (
+    setup_logging,
+    log_session_start,
+    log_session_end,
+    log_error
+)
 
 # 忽略 PocketFlow 在流程正常结束时的警告（返回 None 表示退出是预期行为）
 warnings.filterwarnings("ignore", message="Flow ends:.*not found in", module="pocketflow")
@@ -72,6 +81,18 @@ async def main_async():
     - ThinkNode: 更新分析阶段状态
     - SupervisorNode: 检查计划完成度，记录错误
     """
+    # ========================================
+    # 初始化日志系统
+    # ========================================
+    setup_logging("agent")
+    log_session_start()
+
+    print("\n[INFO] Starting MCP Agent with Manus-style Planning...")
+    print(f"[INFO] Log files location: logs/")
+    print(f"[INFO]   - agent.log: Main log")
+    print(f"[INFO]   - error.log: Error log")
+    print(f"[INFO]   - mcp_manager.log: MCP tool calls")
+
     # ========================================
     # 创建节点实例
     # ========================================
@@ -126,7 +147,11 @@ async def main_async():
     flow = AsyncFlow(start=input_node)
 
     shared = {}
-    await flow.run_async(shared)
+    try:
+        await flow.run_async(shared)
+    finally:
+        # 确保会话结束时记录日志
+        log_session_end()
 
 
 def main():
@@ -140,8 +165,10 @@ def main():
         asyncio.run(main_async())
     except KeyboardInterrupt:
         print("\n[INFO] Interrupted by user, exiting...")
+        log_session_end()
     except Exception as e:
         print(f"\n[ERROR] Unexpected error: {e}")
+        log_error(f"Unexpected error in main: {e}", exc_info=True)
         import traceback
         traceback.print_exc()
         raise

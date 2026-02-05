@@ -17,8 +17,35 @@ load_dotenv()
 # Embedding 相关
 # ============================================================================
 
+# 默认配置
+DEFAULT_HF_ENDPOINT = "https://hf-mirror.com"
+DEFAULT_MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
+
 # 全局模型实例（懒加载）
 _embedding_model = None
+
+
+def get_hf_endpoint() -> str:
+    """获取 HuggingFace 端点地址
+
+    优先使用环境变量 HF_ENDPOINT，否则使用国内镜像。
+
+    Returns:
+        HuggingFace 端点 URL
+    """
+    return os.environ.get("HF_ENDPOINT", DEFAULT_HF_ENDPOINT)
+
+
+def get_embedding_model_name() -> str:
+    """获取 Embedding 模型名称
+
+    优先使用环境变量 EMBEDDING_MODEL_NAME，否则使用默认多语言模型。
+
+    Returns:
+        模型名称
+    """
+    return os.environ.get("EMBEDDING_MODEL_NAME", DEFAULT_MODEL_NAME)
+
 
 def _get_embedding_model():
     """获取 Sentence Transformer 模型单例
@@ -26,14 +53,25 @@ def _get_embedding_model():
     使用多语言模型 paraphrase-multilingual-MiniLM-L12-v2，
     对中文语义理解比英文模型 all-MiniLM-L6-v2 好很多。
     测试结果: 中文语义匹配准确率从 28.6% 提升到 100%
+
+    自动配置国内镜像以解决网络超时问题。
     """
     global _embedding_model
     if _embedding_model is None:
         from sentence_transformers import SentenceTransformer
-        print("[INFO] Loading Embedding model...")
+
+        # 配置 HuggingFace 镜像端点（解决国内网络超时问题）
+        hf_endpoint = get_hf_endpoint()
+        os.environ["HF_ENDPOINT"] = hf_endpoint
+
+        model_name = get_embedding_model_name()
+
+        print(f"[INFO] Loading Embedding model...")
+        print(f"[INFO] HF_ENDPOINT: {hf_endpoint}")
+
         # 多语言模型，中文语义理解更准确
-        _embedding_model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
-        print("[OK] Embedding model loaded (paraphrase-multilingual-MiniLM-L12-v2)")
+        _embedding_model = SentenceTransformer(model_name)
+        print(f"[OK] Embedding model loaded ({model_name})")
     return _embedding_model
 
 
@@ -286,50 +324,3 @@ def get_memory_index() -> SimpleVectorIndex:
         _memory_index.load("memory_index.json")
     return _memory_index
 
-
-# ============================================================================
-# 测试代码
-# ============================================================================
-
-if __name__ == "__main__":
-    import asyncio
-    import sys
-    import io
-
-    # Windows 控制台 UTF-8 输出
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
-
-    async def test():
-        print("Testing Embedding...")
-        text = "今天天气真好"
-        vec = await get_embedding_async(text)
-        print(f"Text: {text}")
-        print(f"Vector dim: {vec.shape}")
-        print(f"Vector[:10]: {vec[:10]}")
-
-        print("\nTesting Vector Index...")
-        index = SimpleVectorIndex()
-
-        # 添加一些记忆
-        texts = [
-            "今天讨论了贵州茅台的股票",
-            "用户喜欢吃火锅",
-            "上次查询了龙虎榜数据"
-        ]
-
-        for text in texts:
-            vec = await get_embedding_async(text)
-            index.add(vec, {"content": text})
-            print(f"Added: {text}")
-
-        # 搜索
-        query = "股票分析"
-        query_vec = await get_embedding_async(query)
-        results = index.search(query_vec, k=2)
-
-        print(f"\nQuery: {query}")
-        for item, sim in results:
-            print(f"  Similarity {sim:.4f}: {item['content']}")
-
-    asyncio.run(test())

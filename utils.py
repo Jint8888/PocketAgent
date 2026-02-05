@@ -23,6 +23,7 @@ warnings.filterwarnings("ignore", module="pydantic")
 # ============================================================================
 
 DEFAULT_MODEL = "deepseek/deepseek-chat"
+DEFAULT_FAST_MODEL = "gemini/gemini-1.5-flash"  # 快速模型（用于简单任务）
 DEFAULT_TEMPERATURE = 0.7
 DEFAULT_MAX_TOKENS = 4096  # 默认最大响应 token 数
 MAX_RETRIES = 3
@@ -75,7 +76,13 @@ def call_llm(messages: List[Dict]) -> str:
     raise RuntimeError(f"LLM call failed after {MAX_RETRIES} attempts: {last_error}")
 
 
-async def call_llm_async(messages: List[Dict]) -> str:
+async def call_llm_async(
+    messages: List[Dict],
+    model: Optional[str] = None,
+    use_fast: bool = False,
+    temperature: Optional[float] = None,
+    max_tokens: Optional[int] = None
+) -> str:
     """
     【异步版本】调用 LLM (推荐)
 
@@ -85,16 +92,35 @@ async def call_llm_async(messages: List[Dict]) -> str:
 
     Args:
         messages: 消息列表
+        model: 指定使用的模型（优先级最高）
+        use_fast: 是否使用快速模型（适用于简单任务，如格式转换、参数解析）
+        temperature: 生成温度（可选，默认使用环境变量）
+        max_tokens: 最大 token 数（可选，默认使用环境变量）
 
     Returns:
         LLM 响应文本
 
     Raises:
         RuntimeError: 多次重试后仍失败时抛出
+
+    模型选择优先级：
+        1. 显式指定的 model 参数
+        2. use_fast=True 时使用快速模型（LLM_FAST_MODEL 环境变量）
+        3. 环境变量 LLM_MODEL
+        4. 默认模型
     """
-    model = os.environ.get("LLM_MODEL", DEFAULT_MODEL)
-    temperature = float(os.environ.get("LLM_TEMPERATURE", str(DEFAULT_TEMPERATURE)))
-    max_tokens = int(os.environ.get("LLM_MAX_TOKENS", str(DEFAULT_MAX_TOKENS)))
+    # 模型选择
+    if model is None:
+        if use_fast:
+            model = os.environ.get("LLM_FAST_MODEL", DEFAULT_FAST_MODEL)
+        else:
+            model = os.environ.get("LLM_MODEL", DEFAULT_MODEL)
+
+    # 参数配置
+    if temperature is None:
+        temperature = float(os.environ.get("LLM_TEMPERATURE", str(DEFAULT_TEMPERATURE)))
+    if max_tokens is None:
+        max_tokens = int(os.environ.get("LLM_MAX_TOKENS", str(DEFAULT_MAX_TOKENS)))
 
     last_error: Optional[Exception] = None
 
@@ -129,24 +155,3 @@ async def async_input(prompt: str) -> str:
     return (await loop.run_in_executor(None, input, prompt)).strip()
 
 
-# ============================================================================
-# 测试代码
-# ============================================================================
-
-if __name__ == "__main__":
-    # 测试同步版本
-    try:
-        call_llm([{"role": "user", "content": "hi"}])
-        print("[OK] LLM sync connection works")
-    except Exception as e:
-        print(f"[ERROR] LLM sync test failed: {e}")
-
-    # 测试异步版本
-    async def test_async():
-        try:
-            await call_llm_async([{"role": "user", "content": "hi"}])
-            print("[OK] LLM async connection works")
-        except Exception as e:
-            print(f"[ERROR] LLM async test failed: {e}")
-
-    asyncio.run(test_async())

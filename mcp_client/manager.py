@@ -31,9 +31,39 @@ MCP 管理器模块 (异步版本)
 import json
 import asyncio
 import os
+import logging
+import traceback
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Dict, List, Any, Optional, Literal
+
+# ============================================================================
+# 日志配置
+# ============================================================================
+
+# 创建日志记录器
+logger = logging.getLogger("mcp_manager")
+logger.setLevel(logging.INFO)  # 生产环境使用 INFO 级别
+
+# 创建文件处理器，写入日志文件
+log_file = Path(__file__).parent.parent / "logs" / "mcp_manager.log"
+log_file.parent.mkdir(parents=True, exist_ok=True)
+file_handler = logging.FileHandler(log_file, encoding="utf-8", mode="a")
+file_handler.setLevel(logging.INFO)  # 只记录 INFO 及以上级别
+
+# 创建控制台处理器（只显示错误）
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.ERROR)  # 生产环境只显示错误
+
+# 设置日志格式
+formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+file_handler.setFormatter(formatter)
+console_handler.setFormatter(formatter)
+
+# 添加处理器
+if not logger.handlers:
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
 
 
 # ============================================================================
@@ -52,6 +82,33 @@ SAFE_ENV_VARS = [
     # 代理设置（某些工具需要）
     "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
     "http_proxy", "https_proxy", "no_proxy",
+]
+
+
+# ============================================================================
+# Stderr 过滤模式（这些是已知的无害信息，不需要显示警告）
+# ============================================================================
+
+STDERR_IGNORE_PATTERNS = [
+    # MCP 服务器正常启动信息
+    "Secure MCP Filesystem Server running",
+    "running on stdio",
+    "MCP Server",
+    # Context7 相关
+    "CLIENT_IP_ENCRYPTION_KEY",
+    "Context7 Documentation MCP Server",
+    # UV/Python 相关的信息性输出
+    "Using Python",
+    "Resolved",
+    "Installed",
+    # 一般性的调试/信息输出
+    "DEBUG:",
+    "INFO:",
+    # Excel-MCP 服务器内部已处理的异常（服务器仍然正常工作）
+    "excel_mcp",
+    "traceback.print_exc()",
+    # 常见的 finally 块输出（通常是清理消息）
+    "finally:",
 ]
 
 
@@ -258,10 +315,14 @@ class MCPManager:
 
     async def _get_tools_stdio_async(self, server_name: str) -> List[Tool]:
         """【异步】通过 stdio 协议获取工具"""
+        logger.debug(f"[{server_name}] Starting stdio tool discovery")
+        
         try:
             from mcp import ClientSession, StdioServerParameters
             from mcp.client.stdio import stdio_client
-        except ImportError:
+            logger.debug(f"[{server_name}] MCP imports successful")
+        except ImportError as e:
+            logger.error(f"[{server_name}] MCP import failed: {e}")
             print(f"  ❌ {server_name}: 未安装 mcp 库")
             return []
 
@@ -269,17 +330,30 @@ class MCPManager:
         tools: List[Tool] = []
 
         try:
+            logger.debug(f"[{server_name}] Creating StdioServerParameters: command={config.command}, args={config.args}")
+            logger.debug(f"[{server_name}] Environment variables: {list(self._get_safe_env(config.env).keys())}")
+            
             server_params = StdioServerParameters(
                 command=config.command,
                 args=config.args,
                 env=self._get_safe_env(config.env)
             )
+            logger.debug(f"[{server_name}] StdioServerParameters created successfully")
 
+            # 方案B修复：使用临时文件捕获 stderr，避免干扰 MCP 协议通信
+            import tempfile
+            errlog_file = tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors='replace')
+            
             # 使用 async with 管理连接生命周期
-            async with stdio_client(server_params) as (read, write):
+            logger.debug(f"[{server_name}] Entering stdio_client context with errlog...")
+            async with stdio_client(server_params, errlog=errlog_file) as (read, write):
+                logger.debug(f"[{server_name}] stdio_client connected, entering ClientSession...")
                 async with ClientSession(read, write) as session:
+                    logger.debug(f"[{server_name}] ClientSession created, initializing...")
                     await session.initialize()
+                    logger.debug(f"[{server_name}] Session initialized, listing tools...")
                     response = await session.list_tools()
+                    logger.debug(f"[{server_name}] Got {len(response.tools)} tools")
 
                     for tool in response.tools:
                         tools.append(Tool(
@@ -288,10 +362,49 @@ class MCPManager:
                             input_schema=tool.inputSchema or {},
                             server_name=server_name
                         ))
+                    logger.debug(f"[{server_name}] Exiting ClientSession...")
+                logger.debug(f"[{server_name}] ClientSession closed")
+            logger.debug(f"[{server_name}] stdio_client context exited successfully")
+            
+            # 读取并记录 stderr 输出（如果有且需要关注）
+            try:
+                errlog_file.seek(0)
+                stderr_content = errlog_file.read()
+                if stderr_content.strip():
+                    # 检查是否应该忽略这些输出
+                    should_warn = not any(
+                        pattern in stderr_content for pattern in STDERR_IGNORE_PATTERNS
+                    )
+                    if should_warn:
+                        logger.warning(f"[{server_name}] Server stderr output: {stderr_content[:500]}")
+                    else:
+                        # 只记录到 debug 级别，不显示在控制台
+                        logger.debug(f"[{server_name}] Server stderr (ignored): {stderr_content[:200]}")
+            finally:
+                errlog_file.close()
 
             print(f"  ✅ {server_name} (stdio): {len(tools)} 个工具")
-        except Exception as e:
-            print(f"  ❌ {server_name} (stdio): {e}")
+            logger.info(f"[{server_name}] Successfully discovered {len(tools)} tools")
+            
+        except BaseException as e:
+            # 捕获包括 ExceptionGroup 在内的所有异常
+            error_msg = str(e)
+            full_traceback = traceback.format_exc()
+            
+            logger.error(f"[{server_name}] Exception type: {type(e).__name__}")
+            logger.error(f"[{server_name}] Exception message: {error_msg}")
+            logger.error(f"[{server_name}] Full traceback:\n{full_traceback}")
+            
+            if hasattr(e, 'exceptions'):
+                # Python 3.11+ ExceptionGroup - 提取内部异常
+                logger.error(f"[{server_name}] ExceptionGroup with {len(e.exceptions)} sub-exceptions:")
+                for i, ex in enumerate(e.exceptions):
+                    logger.error(f"[{server_name}]   Sub-exception {i+1}: {type(ex).__name__}: {ex}")
+                    logger.error(f"[{server_name}]   Sub-traceback:\n{''.join(traceback.format_exception(type(ex), ex, ex.__traceback__))}")
+                inner_errors = [str(ex) for ex in e.exceptions]
+                error_msg = f"{'; '.join(inner_errors)}"
+            
+            print(f"  ❌ {server_name} (stdio): {error_msg}")
 
         return tools
 
@@ -372,6 +485,7 @@ class MCPManager:
         """【异步】通过 stdio 协议调用工具（带超时）"""
         from mcp import ClientSession, StdioServerParameters
         from mcp.client.stdio import stdio_client
+        import tempfile
 
         config = self.servers[server_name]
 
@@ -382,17 +496,47 @@ class MCPManager:
                 env=self._get_safe_env(config.env)
             )
 
-            async with stdio_client(server_params) as (read, write):
-                async with ClientSession(read, write) as session:
-                    await session.initialize()
-                    result = await session.call_tool(tool_name, arguments)
-                    return self._extract_tool_result(result)
+            # 方案B修复：使用临时文件捕获 stderr
+            errlog_file = tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors='replace')
+            
+            try:
+                async with stdio_client(server_params, errlog=errlog_file) as (read, write):
+                    async with ClientSession(read, write) as session:
+                        await session.initialize()
+                        result = await session.call_tool(tool_name, arguments)
+                        return self._extract_tool_result(result)
+            finally:
+                # 记录 stderr 输出（如果有且需要关注）
+                try:
+                    errlog_file.seek(0)
+                    stderr_content = errlog_file.read()
+                    if stderr_content.strip():
+                        should_warn = not any(
+                            pattern in stderr_content for pattern in STDERR_IGNORE_PATTERNS
+                        )
+                        if should_warn:
+                            logger.warning(f"[{server_name}] Tool call stderr: {stderr_content[:500]}")
+                        else:
+                            logger.debug(f"[{server_name}] Tool stderr (ignored): {stderr_content[:200]}")
+                finally:
+                    errlog_file.close()
 
         # 使用 asyncio.wait_for 实现超时控制
         try:
             return await asyncio.wait_for(_call(), timeout=config.timeout)
         except asyncio.TimeoutError:
             return f'{{"error": "工具调用超时（{config.timeout}秒）"}}'
+        except asyncio.CancelledError:
+            return f'{{"error": "工具调用被取消"}}'
+        except BaseException as e:
+            # 捕获 ExceptionGroup / BaseExceptionGroup (Python 3.11+ TaskGroup 异常)
+            error_msg = str(e)
+            if "TaskGroup" in error_msg or "ExceptionGroup" in type(e).__name__:
+                # 尝试提取内部异常
+                if hasattr(e, 'exceptions'):
+                    inner_errors = [str(ex) for ex in e.exceptions]
+                    error_msg = f"TaskGroup errors: {'; '.join(inner_errors)}"
+            return f'{{"error": "{error_msg}"}}'
 
     async def _call_tool_sse_async(
         self, server_name: str, tool_name: str, arguments: Dict[str, Any]
@@ -421,25 +565,38 @@ class MCPManager:
 
     def _get_safe_env(self, config_env: Dict[str, str]) -> Dict[str, str]:
         """
-        获取安全的环境变量子集
+        获取环境变量
 
-        只传递白名单中的系统环境变量，避免泄露敏感信息（如 API keys）。
-        配置文件中明确指定的变量会被添加（用户显式授权）。
+        方案A修复：传递完整的系统环境变量，而非白名单过滤。
+        这样可以确保子进程（如 uvx）能够获得所有必要的环境变量。
+        
+        配置文件中明确指定的变量会覆盖系统环境变量。
         """
-        safe_env = {}
-
-        for key in SAFE_ENV_VARS:
-            # 直接匹配
-            if key in os.environ:
-                safe_env[key] = os.environ[key]
-            # Windows 环境变量不区分大小写，尝试大写匹配
-            elif key.upper() in os.environ:
-                safe_env[key] = os.environ[key.upper()]
-
-        # 配置文件中的变量覆盖/添加（这些是用户明确指定的，可信任）
-        safe_env.update(config_env)
-
-        return safe_env
+        # 方案A：传递完整的系统环境变量
+        full_env = dict(os.environ)
+        
+        # 配置文件中的变量覆盖/添加（这些是用户明确指定的）
+        full_env.update(config_env)
+        
+        return full_env
+        
+        # ====================================================================
+        # 原方案：白名单过滤（已弃用，保留供参考）
+        # ====================================================================
+        # safe_env = {}
+        # 
+        # for key in SAFE_ENV_VARS:
+        #     # 直接匹配
+        #     if key in os.environ:
+        #         safe_env[key] = os.environ[key]
+        #     # Windows 环境变量不区分大小写，尝试大写匹配
+        #     elif key.upper() in os.environ:
+        #         safe_env[key] = os.environ[key.upper()]
+        # 
+        # # 配置文件中的变量覆盖/添加（这些是用户明确指定的，可信任）
+        # safe_env.update(config_env)
+        # 
+        # return safe_env
 
     def _run_sync(self, coro):
         """
@@ -501,7 +658,15 @@ class MCPManager:
         return str(first_content)
 
     def format_tools_for_prompt(self) -> str:
-        """将工具信息格式化为 LLM 可理解的文本（按服务器分组）"""
+        """将工具信息格式化为精简格式，大幅减少 token 消耗
+        
+        优化策略：
+        1. 使用单行格式：tool_name(param1*, param2?): 简短描述
+        2. 参数用 * 表示必填，? 表示可选
+        3. 描述截断到第一行或前80字符
+        4. 移除冗余的类型信息和详细说明
+        5. **保留参数默认值**（如 token），确保 LLM 能使用正确的配置
+        """
         tools_by_server: Dict[str, List[Tool]] = {}
         for tool in self.tools.values():
             if tool.server_name not in tools_by_server:
@@ -509,59 +674,48 @@ class MCPManager:
             tools_by_server[tool.server_name].append(tool)
 
         output_parts = []
-        global_index = 1
 
         for server_name, tools in tools_by_server.items():
             server_config = self.servers.get(server_name)
             server_desc = server_config.description if server_config else ""
+            # 截断服务器描述
+            short_server_desc = server_desc.split('\n')[0][:60] if server_desc else ""
 
-            server_section = [f"## 【{server_name}】 - {server_desc}"]
-            server_section.append(f"   共 {len(tools)} 个工具:")
+            # 服务器标题行（紧凑格式）
+            server_lines = [f"## 【{server_name}】({len(tools)}个工具) - {short_server_desc}"]
 
             for tool in tools:
                 properties = tool.input_schema.get("properties", {})
                 required = tool.input_schema.get("required", [])
 
-                params = []
+                # 参数列表（紧凑格式：name* 必填，name? 可选，有默认值显示 =value）
+                param_parts = []
                 for param_name, param_info in properties.items():
-                    param_type = param_info.get("type", "unknown")
-                    param_desc = param_info.get("description", "")
-                    req_status = "[必填]" if param_name in required else "[可选]"
-                    params.append(f"      - {param_name} ({param_type}): {param_desc} {req_status}")
+                    suffix = "*" if param_name in required else "?"
+                    # 检查是否有默认值
+                    default_value = param_info.get("default")
+                    if default_value is not None:
+                        # 有默认值时显示：param=value
+                        param_parts.append(f"{param_name}={default_value}")
+                    else:
+                        param_parts.append(f"{param_name}{suffix}")
+                param_str = ", ".join(param_parts) if param_parts else ""
 
-                tool_info = f"\n   [{global_index}] {tool.name}\n"
-                tool_info += f"       描述: {tool.description}\n"
-                if params:
-                    tool_info += f"       参数:\n" + "\n".join(params)
+                # 工具描述（截断到第一行或前80字符）
+                desc = tool.description or ""
+                # 取第一行
+                first_line = desc.split('\n')[0].strip()
+                # 截断
+                if len(first_line) > 80:
+                    short_desc = first_line[:77] + "..."
                 else:
-                    tool_info += f"       参数: 无"
+                    short_desc = first_line
 
-                server_section.append(tool_info)
-                global_index += 1
+                # 单行工具格式
+                tool_line = f"  - {tool.name}({param_str}): {short_desc}"
+                server_lines.append(tool_line)
 
-            output_parts.append("\n".join(server_section))
+            output_parts.append("\n".join(server_lines))
 
         return "\n\n".join(output_parts)
 
-
-# ============================================================================
-# 测试代码
-# ============================================================================
-
-if __name__ == "__main__":
-    async def test_async():
-        """异步测试函数"""
-        print("=" * 60)
-        print("MCP Manager 异步测试")
-        print("=" * 60)
-
-        manager = MCPManager("mcp.json")
-
-        # 使用异步方法获取工具
-        tools = await manager.get_all_tools_async()
-
-        print("\n可用工具:")
-        print(manager.format_tools_for_prompt())
-
-    # 运行异步测试
-    asyncio.run(test_async())

@@ -9,21 +9,16 @@
       "timeout": 60,
       "_comment": "必需！请将 <YOUR_PROJECT_PATH> 替换为实际项目路径"
     },
-    "excel-stdio": {
+    "code-execution": {
       "type": "stdio",
       "command": "uvx",
-      "args": ["excel-mcp-server", "stdio"],
-      "description": "Excel MCP Server - Excel 文件处理与分析",
+      "args": [
+        "--no-cache",
+        "code-execution-mcp"
+      ],
+      "description": "代码执行服务 - 支持终端命令和 Python 代码运行，提供会话管理和跨平台支持",
       "enabled": true,
-      "timeout": 60
-    },
-    "context7": {
-      "type": "stdio",
-      "command": "npx",
-      "args": ["-y", "@upstash/context7-mcp"],
-      "description": "Context7 MCP Server - 实时代码文档查询",
-      "enabled": true,
-      "timeout": 60
+      "timeout": 120
     },
     "trends-hub": {
       "type": "stdio",
@@ -32,14 +27,6 @@
       "description": "热点趋势聚合 MCP 服务器，获取各平台热搜数据",
       "enabled": true,
       "timeout": 60
-    },
-    "gaode": {
-      "type": "sse",
-      "url": "https://mcp.amap.com/sse?key=<YOUR_AMAP_KEY>",
-      "description": "高德地图 MCP 服务器，提供地图、导航、POI搜索、天气等服务",
-      "enabled": false,
-      "timeout": 10,
-      "_comment": "请将 <YOUR_AMAP_KEY> 替换为你的高德 API Key"
     },
     "example-sse-server": {
       "type": "sse",

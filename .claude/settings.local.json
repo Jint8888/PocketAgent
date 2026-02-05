@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir:*)",
+      "Bash(ls:*)",
+      "Bash(uv run python:*)",
+      "Bash(find:*)",
+      "mcp__web-reader__webReader",
+      "Bash(uvx:*)",
+      "mcp__web-search-prime__webSearchPrime",
+      "Bash(pip show:*)",
+      "mcp__serena__get_symbols_overview",
+      "mcp__crawl4ai__crawl_url"
+    ]
+  }
+}
